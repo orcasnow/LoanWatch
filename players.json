@@ -1,0 +1,94 @@
+{
+  "players": [
+    {
+      "name_ja": "貴田遼河",
+      "name_en": "Ryoga KIDA",
+      "club": "AAアルヘンティノス・ジュニアーズ",
+      "source": "espn",
+      "espn_id": "345269",
+      "espn_team": "Argentinos",
+      "url": "https://www.espn.com/soccer/player/_/id/345269/ryoga-kida"
+    },
+    {
+      "name_ja": "倍井謙",
+      "name_en": "Ken MASUI",
+      "club": "KVコルトレイク",
+      "source": "espn",
+      "espn_id": "355120",
+      "espn_team": "Kortrijk",
+      "url": "https://www.espn.com/soccer/player/_/id/355120/ken-masui"
+    },
+    {
+      "name_ja": "河面旺成",
+      "name_en": "Akinari KAWAZURA",
+      "club": "水戸ホーリーホック",
+      "source": "football-lab",
+      "url": "https://www.football-lab.jp/mito/report",
+      "jleague_url": "https://www.jleague.jp/player/1603777/"
+    },
+    {
+      "name_ja": "山中亮輔",
+      "name_en": "Ryosuke YAMANAKA",
+      "club": "京都サンガF.C.",
+      "source": "football-lab",
+      "url": "https://www.football-lab.jp/kyot/report",
+      "jleague_url": "https://www.jleague.jp/player/1000187/"
+    },
+    {
+      "name_ja": "森壮一朗",
+      "name_en": "Soichiro Mori",
+      "club": "ファジアーノ岡山",
+      "source": "football-lab",
+      "url": "https://www.football-lab.jp/okay/report",
+      "jleague_url": "https://www.jleague.jp/player/1646309/"
+    },
+    {
+      "name_ja": "三國ケネディエブス",
+      "name_en": "KennedyEgbus MIKUNI",
+      "club": "アビスパ福岡",
+      "source": "football-lab",
+      "url": "https://www.football-lab.jp/fuku/report",
+      "jleague_url": "https://www.jleague.jp/player/1617705/"
+    },
+    {
+      "name_ja": "加藤玄",
+      "name_en": "Gen KATO",
+      "club": "RB大宮アルディージャ",
+      "source": "football-lab",
+      "url": "https://www.football-lab.jp/omiy/report",
+      "jleague_url": "https://www.jleague.jp/player/1636988/?navicode=j2"
+    },
+    {
+      "name_ja": "行德瑛",
+      "name_en": "Ei GYOTOKU",
+      "club": "AC長野パルセイロ",
+      "source": "football-lab",
+      "url": "https://www.football-lab.jp/naga/report",
+      "jleague_url": "https://www.jleague.jp/player/1640482/?navicode=j3"
+    },
+    {
+      "name_ja": "榊原杏太",
+      "name_en": "Kyota SAKAKIBARA",
+      "club": "ツエーゲン金沢",
+      "source": "football-lab",
+      "url": "https://www.football-lab.jp/kana/report",
+      "jleague_url": "https://www.jleague.jp/player/1635543/?navicode=j3"
+    },
+    {
+      "name_ja": "鈴木陽人",
+      "name_en": "Haruto SUZUKI",
+      "club": "FC岐阜",
+      "source": "football-lab",
+      "url": "https://www.football-lab.jp/gifu/report",
+      "jleague_url": "https://www.jleague.jp/player/1637151/?navicode=j3"
+    },
+    {
+      "name_ja": "吉田温紀",
+      "name_en": "Haruki YOSHIDA",
+      "club": "FC琉球",
+      "source": "football-lab",
+      "url": "https://www.football-lab.jp/ryuk/report",
+      "jleague_url": "https://www.jleague.jp/player/1632477/?navicode=j3"
+    }
+  ]
+}
