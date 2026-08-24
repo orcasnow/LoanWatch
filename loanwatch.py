@@ -2,6 +2,11 @@
 
 出力: 選手ごと1行 (先発 / 途中出場 / ベンチ入りのみ / ベンチ外 / 試合なし)
 
+選手設定:
+    スクリプトと同じフォルダの players.json を読み込む
+    (LoanWatch.exe の「選手設定を編集」画面と共通のファイル)。
+    別の場所に置く場合は --players-file で指定する。
+
 準備:
     pip install playwright requests beautifulsoup4 lxml html5lib pandas openpyxl
     playwright install chromium
@@ -30,6 +35,7 @@ import json
 import unicodedata
 from datetime import date, datetime
 from io import StringIO
+from pathlib import Path
 from urllib.parse import urljoin, urlparse, parse_qs
 
 import pandas as pd
@@ -67,12 +73,20 @@ HEADERS = {
 }
 
 # =========================================================
-# 選手マスタ
+# 選手マスタ (players.json から読み込む)
+#   LoanWatch.exe(GUI版)の「選手設定を編集」画面が書き込むファイルと共通。
+#   スクリプトと同じフォルダの players.json を既定で読む
+#   ({"players": [ {...}, {...} ]} 形式)。--players-file で変更可能。
+#
 #   source: "espn" | "transfermarkt" | "football-lab" | "manual"
 #   espn は Last 5 Matches の最新行 → 試合ページの lineUps を辿る。
 #     espn_id は選手ページURLの /id/<数字>/ の部分。
 #     espn_team に想定クラブ(英語表記の一部でよい)を書いておくと、
 #     ESPN側で移籍が未反映のときに備考へ「要確認」を出す。
+#     espn_team_id を書いておくと、チームの結果ページ
+#       (https://www.espn.com/soccer/team/results/_/id/<espn_team_id>)
+#     と突き合わせ、選手ページの Last 5 Matches がチームの最新試合より
+#     古い場合に備考へ「要確認」を出す(選手ページの反映遅れ検知用)。
 #   jleague_url を書いておくと、交代の分数を Jリーグ公式の
 #     「出場履歴」から補完する。Jリーグ公式で選手を検索し、
 #     URL の /player/<数字>/ をそのまま貼ればよい。
@@ -85,53 +99,28 @@ HEADERS = {
 #     そこから該当シーズンの大会別 試合ログへ自動で辿る。
 #   manual は latest に手入力した内容をそのまま出力する。
 # =========================================================
-PLAYERS = [
-    {"name_ja": "貴田遼河", "name_en": "Ryoga KIDA",
-     "club": "AAアルヘンティノス・ジュニアーズ", "source": "espn",
-     "espn_id": "345269", "espn_team": "Argentinos",
-     "url": "https://www.espn.com/soccer/player/_/id/345269/ryoga-kida"},
-    {"name_ja": "倍井謙", "name_en": "Ken MASUI",
-     "club": "KVコルトレイク", "source": "espn",
-     "espn_id": "355120", "espn_team": "Kortrijk",
-     "url": "https://www.espn.com/soccer/player/_/id/355120/ken-masui"},
-    {"name_ja": "河面旺成", "name_en": "Akinari KAWAZURA",
-     "club": "水戸ホーリーホック", "source": "football-lab",
-     "url": "https://www.football-lab.jp/mito/report",
-     "jleague_url": "https://www.jleague.jp/player/1603777/"},
-    {"name_ja": "山中亮輔", "name_en": "Ryosuke YAMANAKA",
-     "club": "京都サンガF.C.", "source": "football-lab",
-     "url": "https://www.football-lab.jp/kyot/report",
-     "jleague_url": "https://www.jleague.jp/player/1000187/"},
-    {"name_ja": "森壮一朗", "name_en": "Soichiro Mori",
-     "club": "ファジアーノ岡山", "source": "football-lab",
-     "url": "https://www.football-lab.jp/okay/report",
-     "jleague_url": "https://www.jleague.jp/player/1646309/"},
-    {"name_ja": "三國ケネディエブス", "name_en": "KennedyEgbus MIKUNI",
-     "club": "アビスパ福岡", "source": "football-lab",
-     "espn_id": "288457", "espn_team": "Avispa",
-     "url": "https://www.football-lab.jp/fuku/report",
-     "jleague_url": "https://www.jleague.jp/player/1617705/"},
-    {"name_ja": "加藤玄", "name_en": "Gen KATO",
-     "club": "RB大宮アルディージャ", "source": "football-lab",
-     "url": "https://www.football-lab.jp/omiy/report",
-     "jleague_url": "https://www.jleague.jp/player/1636988/?navicode=j2"},
-    {"name_ja": "行德瑛", "name_en": "Ei GYOTOKU",
-     "club": "AC長野パルセイロ", "source": "football-lab",
-     "url": "https://www.football-lab.jp/naga/report",
-     "jleague_url": "https://www.jleague.jp/player/1640482/?navicode=j3"},
-    {"name_ja": "榊原杏太", "name_en": "Kyota SAKAKIBARA",
-     "club": "ツエーゲン金沢", "source": "football-lab",
-     "url": "https://www.football-lab.jp/kana/report",
-     "jleague_url": "https://www.jleague.jp/player/1635543/?navicode=j3"},
-    {"name_ja": "鈴木陽人", "name_en": "Haruto SUZUKI",
-     "club": "FC岐阜", "source": "football-lab",
-     "url": "https://www.football-lab.jp/gifu/report",
-     "jleague_url": "https://www.jleague.jp/player/1637151/?navicode=j3"},
-    {"name_ja": "吉田温紀", "name_en": "Haruki YOSHIDA",
-     "club": "FC琉球", "source": "football-lab",
-     "url": "https://www.football-lab.jp/ryuk/report",
-     "jleague_url": "https://www.jleague.jp/player/1632477/?navicode=j3"},
-]
+PLAYERS_FILE = Path(__file__).resolve().parent / "players.json"
+
+
+def load_players(path=PLAYERS_FILE):
+    """players.json から選手マスタ(dictのリスト)を読み込む"""
+    path = Path(path)
+    if not path.exists():
+        raise ScrapeError(f"{path.name} が見つからない",
+                          f"{path} に選手設定ファイルを置く(LoanWatch.exeの"
+                          "「選手設定を編集」で作成・保存したものが使える)", str(path))
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        raise ScrapeError(f"{path.name} の書式が不正: {e}",
+                          "JSON構文を確認する(壊れていればbackupファイルから戻す)",
+                          str(path))
+    players = data.get("players") if isinstance(data, dict) else None
+    if not isinstance(players, list) or not players:
+        raise ScrapeError(f"{path.name} に選手データが無い",
+                          '{"players": [...]} 形式になっているか確認', str(path))
+    return players
+
 
 CFG = {}  # main() で argparse の結果を格納
 
@@ -925,6 +914,34 @@ def espn_judge(html, espn_id):
             "via": f"{where}, subIns={sub_ins}"}
 
 
+def espn_team_latest_result(team_id):
+    """チームの結果ページ(埋め込みJSON)から、完了済み試合の最新日付を返す
+
+    選手ページの Last 5 Matches は反映が遅れることがあるため、チーム全体の
+    結果ページと突き合わせて「これが本当に最新の試合か」を確認する材料にする。
+    戻り値: (日付文字列 "YYYY-MM-DD" または None, 試合URL または None)
+    """
+    url = f"https://www.espn.com/soccer/team/results/_/id/{team_id}"
+    # ESPNはAWS WAFのJS認証チャレンジがあり requests では弾かれるため、
+    # 選手ページ・試合ページと同様にブラウザ経由(render)で取得する。
+    html = render(url, wait_selector="body", locale="en-US", scroll=True)
+    fitt = extract_fitt(html)
+    if fitt is None:
+        debug("チーム結果ページに __espnfitt__ が無い")
+        return None, None
+    try:
+        events = fitt["page"]["content"]["results"]["events"]
+    except (KeyError, TypeError):
+        debug("チーム結果ページのJSONに results.events が無い")
+        return None, None
+    completed = [e for e in events if e.get("completed") and e.get("date")]
+    if not completed:
+        return None, None
+    latest = max(completed, key=lambda e: e["date"])
+    m = re.match(r"(\d{4}-\d{2}-\d{2})", latest["date"])
+    return (m.group(1) if m else None), urljoin(url, latest.get("link", ""))
+
+
 def scrape_espn(player):
     espn_id = str(player["espn_id"])
     html = render(player["url"], wait_selector="table", locale="en-US", scroll=True)
@@ -971,6 +988,21 @@ def scrape_espn(player):
     if expected_app and expected_app != res["status"]:
         notes.append(f"一覧のAPP列は{match['app']}")
         log(f"APP列 '{match['app']}' と判定 '{res['status']}' が食い違います", "WARN")
+
+    # 選手ページの Last 5 Matches がチームの最新試合を反映しているか確認する
+    team_id = player.get("espn_team_id")
+    if team_id and date_str:
+        try:
+            team_date, team_url = espn_team_latest_result(team_id)
+        except ScrapeError as e:
+            log(f"チーム最新試合の確認に失敗: {e.summary()}", "WARN")
+            team_date = team_url = None
+        if team_date and team_date > date_str:
+            notes.append(f"要確認 チームの最新試合は{team_date}({team_url})")
+            log(f"選手ページ({date_str})より新しいチーム試合({team_date})があります。"
+                f"未反映の可能性", "WARN")
+        elif team_date:
+            debug(f"チーム最新試合({team_date})は選手ページ({date_str})以前。反映済みとみなす")
 
     row = result(player, res["status"], match=match["opponent"], date=date_str,
                  match_result=match["match_result"], goals=res["goals"],
@@ -1087,9 +1119,14 @@ def scrape_footballlab(player):
         except ScrapeError as e:
             log(f"公式の成績補完に失敗: {e.summary()}", "WARN")
     fl_minute = member.get("minute")
+    # 先発かつ交代(←OUT)マークが無ければ最後まで出場したとみなす。
+    # マークがあれば fl_minute に交代分数(90分超のロスタイムも含む)が入る。
+    fl_full = status == STARTER and not member.get("has_out")
     minutes, notes = None, []
 
-    if fl_minute:
+    if fl_full:
+        debug("Football-LABに交代(←OUT)マークが無いためフル出場とみなす")
+    elif fl_minute:
         debug(f"Football-LABの矢印から分を取得: {fl_minute}分")
     elif official_row is not None:
         jl_minutes = _to_minutes(jl_value(official_row, official_df.columns, JL_COL_MIN))
@@ -1126,7 +1163,7 @@ def scrape_footballlab(player):
     else:
         notes.append("出場時間は後日更新")
 
-    row["出場時間"] = describe_minutes(status, minutes, fl_minute)
+    row["出場時間"] = "フル出場" if fl_full else describe_minutes(status, minutes, fl_minute)
     if notes:
         row["備考"] = " / ".join([p for p in [row["備考"]] + notes if p])
     return row
@@ -1336,6 +1373,8 @@ def build_parser():
     ap.add_argument("--stale-days", type=int, default=14, dest="stale_days",
                     help="この日数以上前の試合は注意表示する(既定: 14)")
     ap.add_argument("--out", default="loan_players_latest", help="出力ファイル名(拡張子なし)")
+    ap.add_argument("--players-file", dest="players_file", default=None,
+                    help="選手設定ファイルのパス(既定: スクリプトと同じフォルダのplayers.json)")
     return ap
 
 
@@ -1343,7 +1382,15 @@ def main():
     args = build_parser().parse_args()
     CFG.update(vars(args))
 
-    targets = PLAYERS
+    players_file = Path(args.players_file) if args.players_file else PLAYERS_FILE
+    try:
+        targets = load_players(players_file)
+    except ScrapeError as e:
+        print(f"選手設定の読み込みに失敗しました: {e.summary()}", file=sys.stderr)
+        if e.detail:
+            print(f"  {e.detail}", file=sys.stderr)
+        return 1
+
     if args.only:
         wanted = {norm(x) for x in args.only}
         targets = [p for p in targets if norm(p["name_ja"]) in wanted]

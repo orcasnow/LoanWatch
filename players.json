@@ -7,6 +7,7 @@
       "source": "espn",
       "espn_id": "345269",
       "espn_team": "Argentinos",
+      "espn_team_id": "3",
       "url": "https://www.espn.com/soccer/player/_/id/345269/ryoga-kida"
     },
     {
@@ -16,6 +17,7 @@
       "source": "espn",
       "espn_id": "355120",
       "espn_team": "Kortrijk",
+      "espn_team_id": "5786",
       "url": "https://www.espn.com/soccer/player/_/id/355120/ken-masui"
     },
     {

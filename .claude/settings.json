@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(C:/Users/lostm/anaconda3/python.exe -c ' *)",
+      "Bash(C:/Users/lostm/anaconda3/python.exe loanwatch.py --only 倍井謙 --debug --out 'C:\\\\Users\\\\lostm/AppData/Local/Temp/claude/c--Users-lostm-Downloads-LoanWatch/5bc3d8fb-3a4f-4187-8c62-f207f7ec68ec/scratchpad/test_json_load')",
+      "Bash(\"C:/Users/lostm/anaconda3/python.exe\" loanwatch.py --players-file \"nonexistent.json\" --only 倍井謙)",
+      "Bash(echo \"exit=$?\")"
+    ]
+  }
+}
