@@ -1,6 +1,8 @@
 """LoanWatch - 名古屋グランパス レンタル移籍選手の最新試合 出場ステータス一覧
 
 出力: 選手ごと1行 (先発 / 途中出場 / ベンチ入りのみ / ベンチ外 / 試合なし)
+      ただしトップチームと U-21 Ｊリーグの両方に今季の出場履歴がある選手は
+      大会ごとに1行ずつ(=2行)出力する。
 
 準備:
     pip install playwright requests beautifulsoup4 lxml html5lib pandas openpyxl
@@ -19,6 +21,9 @@ GUI版:
 
 出力列:
     日付 / 経過 を先頭寄りに置き、いつの試合かがひと目で分かるようにしている。
+    リーグ名 はその試合の大会名(明治安田Ｊ１ / U-21 Ｊリーグ / ESPNは英語表記)。
+    ベンチ外・ベンチ入りのみは大会名を特定できないため、Jリーグ公式の
+    所属リーグで代用し、備考に「リーグ名は所属リーグから推定」と入れる。
     試合 は対戦相手のみ、試合結果 は対象クラブ視点の勝敗・スコア。
     警告/退場 は「警告数/退場数」で表示する。
     --stale-days で指定した日数より古い試合しか取れなかった選手は末尾に列挙する。
@@ -91,8 +96,8 @@ KW_SUBIN_COL = ["交代IN", "投入", "途中出場"]
 # 中止・延期を示す本文中の文言
 RE_CANCELLED = re.compile(r"(中止|延期|試合データがありません|データはありません)")
 
-COLUMNS = ["選手", "クラブ", "日付", "経過", "チーム最新試合日付", "ステータス", "出場時間",
-           "試合", "試合結果", "ゴール数", "警告/退場", "備考", "URL"]
+COLUMNS = ["選手", "クラブ", "リーグ名", "日付", "経過", "チーム最新試合日付", "ステータス",
+           "出場時間", "試合", "試合結果", "ゴール数", "警告/退場", "備考", "URL"]
 RE_GAME_URL = re.compile(r"/soccer/match/_/gameId/(\d+)")
 
 HEADERS = {
@@ -235,9 +240,10 @@ def format_elapsed(date_str):
 
 
 def result(player, status, match="", date="", minutes=None, url=None, note="",
-           match_result="", goals="", cards="",
+           match_result="", goals="", cards="", league="",
            team_latest_date="", team_latest_url=""):
     return {"選手": player["name_ja"], "クラブ": player["club"],
+            "リーグ名": league,
             "日付": date, "経過": format_elapsed(date),
             "チーム最新試合日付": team_latest_date,
             "ステータス": status,
@@ -539,7 +545,12 @@ def fetch(url):
 
 
 def fl_latest_match(report_url):
-    """レポート一覧から、指定年のうち日付が最も新しい試合を返す"""
+    """レポート一覧から、指定年のうち日付が最も新しい試合を返す
+
+    戻り値: (対戦相手, 試合URL, 日付文字列, 今季初戦の日付)
+    今季初戦の日付は、全シーズン分が入っているJリーグ公式の出場履歴から
+    「今季の」U-21 Ｊリーグの記録だけを取り出すときの基準に使う。
+    """
     html = fetch(report_url)
     save_html(html, urlparse(report_url).path + "_report")
     soup = BeautifulSoup(html, "lxml")
@@ -571,7 +582,11 @@ def fl_latest_match(report_url):
     cands.sort(key=lambda x: x[0])
     (y, mo, d), label, url = cands[-1]
     debug(f"{CFG['year']}年の試合リンク {len(cands)}件、最新 {y}-{mo:02d}-{d:02d}")
-    return fl_opponent_from_label(label), url, f"{y}-{mo:02d}-{d:02d}"
+    try:
+        season_start = date(*cands[0][0])
+    except ValueError:
+        season_start = None
+    return fl_opponent_from_label(label), url, f"{y}-{mo:02d}-{d:02d}", season_start
 
 
 def fl_opponent_from_label(label):
@@ -667,10 +682,10 @@ def _footballlab_core(player, latest):
     ベンチ外かベンチ入りかは、この表に名前があるかどうかでしか判別できない。
     戻り値の _fl キーに判定材料を入れ、呼び出し側で出場時間を補完する。
     latest は呼び出し側で取得済みの fl_latest_match() の戻り値
-    (label, match_url, date) — チーム最新試合日付列と同じ取得を
+    (label, match_url, date, season_start) — チーム最新試合日付列と同じ取得を
     二重に行わないよう、ここでは受け取るだけにする。
     """
-    label, match_url, date = latest
+    label, match_url, date = latest[:3]
     html = fetch(match_url)
     save_html(html, f"{player['name_ja']}_fl_match")
     soup = BeautifulSoup(html, "lxml")
@@ -901,6 +916,24 @@ def espn_find_record(fitt, espn_id):
     return None, None, None
 
 
+def espn_league_name(fitt):
+    """試合ページのJSONから大会名を取り出す
+
+    ``page.content.gamepackage.league`` に "Argentine Liga Profesional de Fútbol"
+    のような正式名称が入っている。無ければ短縮表記(gmStrp.nte)、
+    リーグID("arg.1")の順に落とす。
+    """
+    try:
+        gp = fitt["page"]["content"]["gamepackage"]
+    except (KeyError, TypeError):
+        debug("試合ページのJSONに gamepackage が無い")
+        return ""
+    for value in (gp.get("league"), (gp.get("gmStrp") or {}).get("nte"), gp.get("lg")):
+        if value:
+            return str(value).strip()
+    return ""
+
+
 def espn_judge(html, espn_id):
     """試合ページのJSONから出場状況を判定する"""
     fitt = extract_fitt(html)
@@ -908,12 +941,13 @@ def espn_judge(html, espn_id):
         raise ScrapeError("__espnfitt__ が見つからない",
                           "--headed で描画を確認する。ページ構造の変更かもしれない")
 
+    league = espn_league_name(fitt)
     path, rec, lineup = espn_find_record(fitt, espn_id)
     if rec is None:
         debug("JSONに選手レコードが無い(メンバー入りしていない)")
         return {"status": OUT_SQUAD, "minutes": None, "entry": None,
                 "exit": None, "swap": None, "goals": "", "cards": "",
-                "via": "JSON(レコード無し)"}
+                "league": league, "via": "JSON(レコード無し)"}
 
     debug(f"採用: {path} / keys={list(rec)}")
     lineup = lineup or {}
@@ -948,7 +982,7 @@ def espn_judge(html, espn_id):
              "substitutes" if espn_id in subs else
              "unused" if espn_id in unused else "リスト外")
     return {"status": status, "minutes": minutes, "entry": entry, "exit": exit_min,
-            "swap": swap, "team": rec.get("tmName", ""),
+            "swap": swap, "team": rec.get("tmName", ""), "league": league,
             "goals": str(stat_int(rec, "totalGoals")),
             "cards": f"{stat_int(rec, 'yellowCards')}/{stat_int(rec, 'redCards')}",
             "via": f"{where}, subIns={sub_ins}"}
@@ -1047,7 +1081,8 @@ def scrape_espn(player):
 
     row = result(player, res["status"], match=match["opponent"], date=date_str,
                  match_result=match["match_result"], goals=res["goals"],
-                 cards=res["cards"], url=match["url"], note=" / ".join(notes),
+                 cards=res["cards"], league=res.get("league", ""),
+                 url=match["url"], note=" / ".join(notes),
                  team_latest_date=team_date or "", team_latest_url=team_url or "")
     row["出場時間"] = minutes_text
     debug(f"判定経路: {res['via']}")
@@ -1056,21 +1091,7 @@ def scrape_espn(player):
 
 def jl_latest_row(player):
     """Jリーグ公式の出場履歴から最新行を取り出す(出場時間の補完用)"""
-    url = player["jleague_url"]
-    html = fetch(url)
-    save_html(html, f"{player['name_ja']}_jleague")
-    df = jl_history_table(html)
-    if df is None:
-        debug("Jリーグ公式は表を画面側で描画するためブラウザで取得します")
-        html = render(url, wait_selector="table", locale="ja-JP", scroll=True)
-        df = jl_history_table(html)
-    if df is None:
-        raise ScrapeError("出場履歴テーブルが見つからない",
-                          "--save-html でHTMLを確認する", url)
-
-    date_col = find_col(df.columns, [JL_COL_DATE])
-    df["_date"] = df[date_col].map(jl_parse_date)
-    df = df.dropna(subset=["_date"]).sort_values("_date")
+    df, _ = jl_history_df(player)
     if df.empty:
         return None, None, None
     latest = df.iloc[-1]
@@ -1117,6 +1138,10 @@ def scrape_footballlab(player):
 
     ベンチ外とベンチ入りの区別は Football-LAB のメンバー表でしか付かない。
     一方、交代の分数は後日更新のため、当日はJリーグ公式の出場試合時間を使う。
+
+    戻り値は行のリスト。U-21 Ｊリーグはトップチームとは別日程で開催され、
+    Football-LAB のレポートにも載らないため、Jリーグ公式の出場履歴に今季の
+    記録があれば2行目として返す。
     """
     fallback = None if CFG.get("no_fallback") else player.get("jleague_url")
 
@@ -1129,13 +1154,47 @@ def scrape_footballlab(player):
             # 今季まだ1試合も消化していない。Jリーグ公式に落とすと
             # 昨季以前の試合を最新として拾ってしまうので切り替えない
             log(f"{CFG['year']}年の試合が0件のため 試合なし で確定します")
-            return blank(player, NO_MATCH, f"{CFG['year']}年の試合がまだない(中止・延期など)")
+            return [blank(player, NO_MATCH,
+                          f"{CFG['year']}年の試合がまだない(中止・延期など)")]
         if not fallback:
             raise
         log(f"Football-LAB失敗({e.message}) → Jリーグ公式のみで判定します", "WARN")
         jl = scrape_jleague(player, note_prefix="FL取得失敗のため ")
         jl["備考"] += " / ベンチ外は判別不可"
-        return jl
+        return with_u21_row([jl], player, None)
+    row = jl_fill_league(_footballlab_row(player, latest), player)
+    return with_u21_row([row], player, latest[3])
+
+
+def with_u21_row(rows, player, season_start):
+    """U-21 Ｊリーグの最新試合があれば行を足して返す
+
+    トップチームの行は Football-LAB のレポート(=リーグ戦・カップ戦)から作るため、
+    U-21 Ｊリーグの出場はJリーグ公式の出場履歴からしか拾えない。
+    """
+    if CFG.get("no_fallback") or not player.get("jleague_url"):
+        return rows
+    try:
+        df, _ = jl_history_df(player)
+    except ScrapeError as e:
+        log(f"U-21 Ｊリーグの確認に失敗: {e.summary()}", "WARN")
+        return rows
+    u21 = jl_u21_row(player, df, season_start)
+    if u21 is None:
+        return rows
+    # Football-LAB が取れずJリーグ公式に落ちた場合、1行目自体が
+    # U-21 の試合ということがある。その時は二重に出さない。
+    if any(r["日付"] == u21["日付"] and r["試合"] == u21["試合"] for r in rows):
+        debug("U-21 Ｊリーグの試合は1行目と同じなので追加しない")
+        return rows
+    log(f"U-21 Ｊリーグの出場履歴を追加: {u21['日付']} {u21['ステータス']}")
+    rows.append(u21)
+    return rows
+
+
+def _footballlab_row(player, latest):
+    """Football-LAB(+Jリーグ公式)で、トップチームの最新試合の行を1つ作る"""
+    fallback = None if CFG.get("no_fallback") else player.get("jleague_url")
     team_latest_date, team_latest_url = latest[2], latest[1]
 
     try:
@@ -1249,6 +1308,28 @@ JL_COL_MIN = "出場試合時間"
 JL_COL_GOALS = "ゴール数"
 JL_COL_RESULT = "勝敗"
 JL_COL_CARDS = "警告/退場"
+JL_COL_COMP = "大会"
+JL_COL_OPP = "対戦相手"
+JL_COL_SHOTS = "シュート数"
+
+# 選手ページに埋め込まれたJSON(playerHistory)を、上の表と同じ列名に整形する。
+# 表のHTMLには直近数試合しか描かれないが、JSONには全試合分が入っている。
+JL_HISTORY_COLUMNS = [JL_COL_DATE, JL_COL_COMP, JL_COL_OPP, JL_COL_RESULT,
+                      JL_COL_APP, JL_COL_GOALS, JL_COL_SHOTS, JL_COL_MIN,
+                      JL_COL_CARDS]
+JL_APPEARANCE = {"start": "先発", "sub": "サブ"}
+JL_OUTCOME = {"win": "勝", "draw": "分", "loss": "負"}
+# 大会名 "U-21 Ｊリーグ" の判定用(NFKC正規化してから照合する)
+RE_U21 = re.compile(r"U-?21", re.I)
+# 選手ページが持つ「現在の所属リーグ」。埋め込みJSONの入れ子の深さによって
+# 引用符のエスケープ(\")が付いたり付かなかったりするため \\* で吸収する。
+#   ..."gameKindName":"２０２６／２７明治安田Ｊ１リーグ","gameKindId":2...
+RE_JL_GAME_KIND = re.compile(
+    r'gameKindName\\*"\s*:\s*\\*"(.*?)\\*"\s*,\s*\\*"gameKindId\\*"\s*:\s*(\d+)')
+
+# 同じ選手ページを何度も取りに行かないよう、1回の実行中は結果を使い回す
+# {URL: (出場履歴のDataFrame, 所属リーグ名)}
+_JL_HISTORY_CACHE = {}
 
 
 def jl_parse_date(text):
@@ -1265,8 +1346,91 @@ def jl_parse_date(text):
         return None
 
 
+def jl_history_records(html):
+    """ページに埋め込まれた出場履歴JSON(playerHistory)を取り出す
+
+    Jリーグ公式は Next.js のストリーミングデータとして全試合分を埋め込む一方、
+    HTMLの表には直近の数試合しか描画しない。JSONを読めば U-21 Ｊリーグを含む
+    全大会の履歴が、大会名付きで取れる。見つからなければ None。
+    """
+    i = html.find("playerHistory")
+    if i < 0:
+        debug("ページに playerHistory が無い。HTMLの表から読む")
+        return None
+    start = html.find("[", i)
+    if start < 0:
+        return None
+    depth, end = 0, -1
+    for j in range(start, len(html)):
+        if html[j] == "[":
+            depth += 1
+        elif html[j] == "]":
+            depth -= 1
+            if depth == 0:
+                end = j + 1
+                break
+    if end < 0:
+        return None
+    raw = html[start:end]
+    # 埋め込みはJSの文字列リテラル内にあるため、多くの場合 \" でエスケープ
+    # されている。素のまま読めなければ、エスケープを戻してから読み直す。
+    for text in (raw, raw.replace('\\"', '"').replace("\\\\", "\\")):
+        try:
+            records = json.loads(text)
+        except ValueError:
+            continue
+        if isinstance(records, list) and all(isinstance(r, dict) for r in records):
+            return records
+    debug("playerHistory を JSON として解釈できなかった")
+    return None
+
+
+def jl_result_text(rec):
+    """JSONの result を '勝 3-0' / '負 1-1(PK4-5)' の表記にする"""
+    r = rec.get("result") or {}
+    mark = JL_OUTCOME.get(r.get("outcome"), "")
+    if r.get("playerScore") is None:
+        return mark
+    text = f"{mark} {r['playerScore']}-{r['opponentScore']}".strip()
+    pk = r.get("penalty") or {}
+    if pk:
+        text += f"(PK{pk.get('playerScore')}-{pk.get('opponentScore')})"
+    return text
+
+
+def jl_records_to_frame(records):
+    """playerHistory を、HTMLの表と同じ列名の DataFrame にする"""
+    rows = []
+    for rec in records:
+        minutes = rec.get("minutes")
+        rows.append({
+            JL_COL_DATE: rec.get("date", ""),
+            JL_COL_COMP: rec.get("competition", ""),
+            JL_COL_OPP: rec.get("opponent", ""),
+            JL_COL_RESULT: jl_result_text(rec),
+            JL_COL_APP: JL_APPEARANCE.get(rec.get("appearance"),
+                                          rec.get("appearance") or ""),
+            JL_COL_GOALS: "" if rec.get("goals") is None else str(rec["goals"]),
+            JL_COL_SHOTS: "" if rec.get("shots") is None else str(rec["shots"]),
+            JL_COL_MIN: f"{minutes}分" if minutes else "",
+            JL_COL_CARDS: rec.get("cards", ""),
+            # 大会ID。所属リーグ(gameKindId)と突き合わせて大会名を引くのに使う
+            "_kind": str(rec.get("gameKindId", "")),
+        })
+    return pd.DataFrame(rows, columns=JL_HISTORY_COLUMNS + ["_kind"])
+
+
 def jl_history_table(html):
-    """出場履歴のテーブルを DataFrame で返す"""
+    """出場履歴のテーブルを DataFrame で返す
+
+    埋め込みJSONを優先する。HTMLの表は直近の数試合しか描画されないため、
+    表だけを読むと少し前の試合や U-21 Ｊリーグの記録を取りこぼす。
+    """
+    records = jl_history_records(html)
+    if records:
+        debug(f"出場履歴JSONから{len(records)}行を取得")
+        return jl_records_to_frame(records)
+
     frames = read_tables_any(html)
     for df in frames:
         cols = [str(c) for c in df.columns]
@@ -1279,13 +1443,75 @@ def jl_history_table(html):
     return None
 
 
-def jl_match_record(player, target_date=None):
-    """Jリーグ公式の出場履歴から、指定日（なければ最新）の1行を返す。"""
+def jl_league_from_page(html, df):
+    """選手ページから、その選手が今所属しているリーグの大会名を返す
+
+    ページには gameKindName("２０２６／２７明治安田Ｊ１リーグ")と、出場履歴と
+    共通の大会ID(gameKindId)が入っている。同じIDの出場履歴があれば、そちらの
+    表記("明治安田Ｊ１")に揃えて他の行と見た目を合わせる。
+    """
+    m = RE_JL_GAME_KIND.search(html)
+    if not m:
+        debug("選手ページに gameKindName が無い")
+        return ""
+    name, kind = m.group(1).strip(), m.group(2)
+    comp_col = find_col(df.columns, [JL_COL_COMP]) if df is not None else None
+    if comp_col is not None and "_kind" in df.columns:
+        same = df[df["_kind"] == kind]
+        if not same.empty:
+            return str(same.iloc[-1][comp_col]).strip()
+    return name
+
+
+def jl_current_league(player):
+    """選手の現在の所属リーグ名。未取得なら選手ページを取りに行く"""
     url = player.get("jleague_url") or player.get("url")
+    if url not in _JL_HISTORY_CACHE:
+        jl_history_df(player)
+    cached = _JL_HISTORY_CACHE.get(url)
+    return cached[1] if cached else ""
+
+
+def jl_fill_league(row, player):
+    """リーグ名が空の行に、Jリーグ公式の所属リーグ名を補う
+
+    ベンチ外・ベンチ入りのみの試合は公式の出場履歴に載らないため、その試合の
+    大会名を直接は特定できない。代わりに所属リーグを当てる。カップ戦だった
+    可能性は残るので、推定であることを備考に残す。
+    """
+    if row.get("リーグ名") or row["ステータス"] == NO_MATCH:
+        return row
+    if CFG.get("no_fallback") or not player.get("jleague_url"):
+        return row
+    try:
+        league = jl_current_league(player)
+    except ScrapeError as e:
+        log(f"所属リーグの取得に失敗: {e.summary()}", "WARN")
+        return row
+    if not league:
+        return row
+    debug(f"リーグ名を所属リーグで補完: {league}")
+    row["リーグ名"] = league
+    row["備考"] = " / ".join([p for p in [row["備考"], "リーグ名は所属リーグから推定"] if p])
+    return row
+
+
+def jl_history_df(player):
+    """Jリーグ公式の出場履歴を (DataFrame, URL) で返す。日付昇順・_date列付き
+
+    出場時間の補完・同日行の照合・U-21 の抽出で同じページを何度も取りに
+    行かないよう、1回の実行中は取得結果を使い回す。
+    """
+    url = player.get("jleague_url") or player.get("url")
+    cached = _JL_HISTORY_CACHE.get(url)
+    if cached is not None:
+        return cached[0].copy(), url
+
     html = fetch(url)
     save_html(html, f"{player['name_ja']}_jleague")
     df = jl_history_table(html)
     if df is None:
+        # サーバ側で描画されていない場合はブラウザで取り直す
         debug("Jリーグ公式は表を画面側で描画するためブラウザで取得します")
         html = render(url, wait_selector="table", locale="ja-JP", scroll=True)
         save_html(html, f"{player['name_ja']}_jleague_rendered")
@@ -1297,6 +1523,13 @@ def jl_match_record(player, target_date=None):
     date_col = find_col(df.columns, [JL_COL_DATE])
     df["_date"] = df[date_col].map(jl_parse_date)
     df = df.dropna(subset=["_date"]).sort_values("_date")
+    _JL_HISTORY_CACHE[url] = (df, jl_league_from_page(html, df))
+    return df.copy(), url
+
+
+def jl_match_record(player, target_date=None):
+    """Jリーグ公式の出場履歴から、指定日（なければ最新）の1行を返す。"""
+    df, url = jl_history_df(player)
     if df.empty:
         return None, df, url
     if target_date:
@@ -1317,10 +1550,58 @@ def jl_value(row, columns, label):
 
 
 def jl_extra_fields(row, columns):
-    """公式の1行をExcel用のゴール・結果・警告/退場列へ変換する。"""
-    return {"試合結果": jl_value(row, columns, JL_COL_RESULT),
+    """公式の1行をExcel用のリーグ名・ゴール・結果・警告/退場列へ変換する。"""
+    return {"リーグ名": jl_value(row, columns, JL_COL_COMP),
+            "試合結果": jl_value(row, columns, JL_COL_RESULT),
             "ゴール数": jl_value(row, columns, JL_COL_GOALS),
             "警告/退場": jl_value(row, columns, JL_COL_CARDS)}
+
+
+def jl_status_from_row(row, columns):
+    """公式の出場履歴1行から、出場区分と出場時間の表示を組み立てる
+
+    出場履歴には帯同しなかった試合が載らないため、ベンチ外は判別できない。
+    """
+    minutes = _to_minutes(jl_value(row, columns, JL_COL_MIN))
+    app = jl_value(row, columns, JL_COL_APP)
+    if "先発" in app:
+        if minutes and minutes < 90:
+            return STARTER, f"先発〜{minutes}分で交代"
+        return STARTER, (f"{minutes}分" if minutes else "")
+    if minutes:
+        _, label = minutes_to_entry(minutes)
+        return SUBBED_IN, (f"{label}から出場({minutes}分)" if label else f"{minutes}分")
+    return BENCH, ""
+
+
+def jl_u21_row(player, df, season_start):
+    """出場履歴から U-21 Ｊリーグの今季最新試合を1行にする。無ければ None
+
+    U-21 Ｊリーグはトップチームとは別日程で開催されるため、Football-LAB の
+    マッチレポートには載らない。両方に出場している選手を1行にまとめると
+    どちらかが消えてしまうので、大会ごとに別の行として出す。
+    """
+    if df.empty:
+        return None
+    comp_col = find_col(df.columns, [JL_COL_COMP])
+    if comp_col is None:
+        debug("出場履歴に大会列が無いためU-21の判定をスキップ")
+        return None
+    u21 = df[df[comp_col].map(lambda v: bool(RE_U21.search(norm(v))))]
+    # 出場履歴は過去シーズン分も含むため、今季の記録だけに絞る
+    u21 = u21[u21["_date"] >= (season_start or date(CFG["year"], 1, 1))]
+    if u21.empty:
+        return None
+
+    latest = u21.iloc[-1]
+    status, minutes_text = jl_status_from_row(latest, df.columns)
+    row = result(player, status, match=jl_value(latest, df.columns, JL_COL_OPP),
+                 date=latest["_date"].strftime("%Y-%m-%d"),
+                 url=player.get("jleague_url") or player.get("url"),
+                 note="Jリーグ公式(U-21 Ｊリーグ) / ベンチ外は判別不可")
+    row.update(jl_extra_fields(latest, df.columns))
+    row["出場時間"] = minutes_text
+    return row
 
 
 def minutes_to_entry(minutes):
@@ -1334,60 +1615,18 @@ def minutes_to_entry(minutes):
 
 
 def scrape_jleague(player, note_prefix=""):
-    url = player.get("jleague_url") or player.get("url")
-    html = fetch(url)
-    save_html(html, f"{player['name_ja']}_jleague")
-
-    df = jl_history_table(html)
-    if df is None:
-        # サーバ側で描画されていない場合はブラウザで取り直す
-        debug("Jリーグ公式は表を画面側で描画するためブラウザで取得します")
-        html = render(url, wait_selector="table", locale="ja-JP", scroll=True)
-        save_html(html, f"{player['name_ja']}_jleague_rendered")
-        df = jl_history_table(html)
-    if df is None:
-        raise ScrapeError("出場履歴テーブルが見つからない",
-                          "--save-html でHTMLを保存し列名を確認する", describe(html, url))
-
-    date_col = find_col(df.columns, [JL_COL_DATE])
-    min_col = find_col(df.columns, [JL_COL_MIN])
-    app_col = find_col(df.columns, [JL_COL_APP])
-    opp_col = find_col(df.columns, ["対戦相手"])
-    comp_col = find_col(df.columns, ["大会"])
-    res_col = find_col(df.columns, ["勝敗"])
-
-    df["_date"] = df[date_col].map(jl_parse_date)
-    df = df.dropna(subset=["_date"])
+    df, url = jl_history_df(player)
     if df.empty:
         return blank(player, NO_MATCH, f"{note_prefix}出場履歴に試合行がない")
 
-    df = df.sort_values("_date")
     latest = df.iloc[-1]
     debug(f"出場履歴 {len(df)}行、最新={latest['_date']}")
 
-    minutes = _to_minutes(latest[min_col]) if min_col else None
-    app = str(latest[app_col]).strip() if app_col else ""
-
-    if "先発" in app:
-        status = STARTER
-        minutes_text = f"{minutes}分" if minutes else ""
-        if minutes and minutes < 90:
-            minutes_text = f"先発〜{minutes}分で交代"
-    elif minutes:
-        status = SUBBED_IN
-        entry, label = minutes_to_entry(minutes)
-        minutes_text = f"{label}から出場({minutes}分)" if label else f"{minutes}分"
-    else:
-        status, minutes_text = BENCH, ""
-
-    match_label = str(latest[opp_col]).strip() if opp_col else ""
-    if match_label == "nan":
-        match_label = ""
-
-    row = result(player, status, match=match_label,
+    status, minutes_text = jl_status_from_row(latest, df.columns)
+    row = result(player, status, match=jl_value(latest, df.columns, JL_COL_OPP),
                  date=latest["_date"].strftime("%Y-%m-%d"), url=url,
-                 note=(note_prefix + "Jリーグ公式").strip(),
-                 **jl_extra_fields(latest, df.columns))
+                 note=(note_prefix + "Jリーグ公式").strip())
+    row.update(jl_extra_fields(latest, df.columns))
     row["出場時間"] = minutes_text
     return row
 
@@ -1535,7 +1774,8 @@ def main():
         print("対象の選手がいません。--only / --source の指定を確認してください", file=sys.stderr)
         return 1
 
-    rows, errors = [], []
+    _JL_HISTORY_CACHE.clear()
+    rows, errors, success = [], [], 0
     for p in targets:
         print(f"■ {p['name_ja']} ({p['club']}) [{p['source']}]")
         scraper = SCRAPERS.get(p["source"])
@@ -1545,9 +1785,13 @@ def main():
             errors.append((p["name_ja"], f"未対応source: {p['source']}"))
             continue
         try:
+            # スクレイパは1行(dict)、または大会ごとの複数行(list)を返す
             res = scraper(p)
-            log(f"{res['ステータス']} {res['出場時間']} ({res['日付']})")
-            rows.append(res)
+            for r in (res if isinstance(res, list) else [res]):
+                log(f"{r['リーグ名'] or '大会不明'} / {r['ステータス']} "
+                    f"{r['出場時間']} ({r['日付']})")
+                rows.append(r)
+            success += 1
         except ScrapeError as e:
             log(e.summary(), "ERROR")
             if e.detail:
@@ -1594,7 +1838,7 @@ def main():
     if undated:
         print(f"\n[注意] 日付を特定できなかった選手: {', '.join(undated)}")
 
-    print(f"\n成功 {len(rows) - len(errors)}件 / 失敗 {len(errors)}件")
+    print(f"\n成功 {success}件 / 失敗 {len(errors)}件")
     for name, msg in errors:
         print(f"  - {name}: {msg}")
 
