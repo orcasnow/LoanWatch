@@ -91,7 +91,7 @@ KW_SUBIN_COL = ["交代IN", "投入", "途中出場"]
 # 中止・延期を示す本文中の文言
 RE_CANCELLED = re.compile(r"(中止|延期|試合データがありません|データはありません)")
 
-COLUMNS = ["選手", "クラブ", "日付", "経過", "ステータス", "出場時間",
+COLUMNS = ["選手", "クラブ", "日付", "経過", "チーム最新試合日付", "ステータス", "出場時間",
            "試合", "試合結果", "ゴール数", "警告/退場", "備考", "URL"]
 RE_GAME_URL = re.compile(r"/soccer/match/_/gameId/(\d+)")
 
@@ -235,16 +235,19 @@ def format_elapsed(date_str):
 
 
 def result(player, status, match="", date="", minutes=None, url=None, note="",
-           match_result="", goals="", cards=""):
+           match_result="", goals="", cards="",
+           team_latest_date="", team_latest_url=""):
     return {"選手": player["name_ja"], "クラブ": player["club"],
             "日付": date, "経過": format_elapsed(date),
+            "チーム最新試合日付": team_latest_date,
             "ステータス": status,
             "出場時間": f"{minutes}分" if minutes else "",
             "試合": match,
             "試合結果": match_result,
             "ゴール数": goals,
             "警告/退場": cards,
-            "備考": note, "URL": url or player.get("url", "")}
+            "備考": note, "URL": url or player.get("url", ""),
+            "_team_latest_url": team_latest_url}
 
 
 def blank(player, status, note=""):
@@ -657,14 +660,17 @@ def fl_member_status(html, name_ja):
     return {"section": None, "has_in": False, "has_out": False, "minute": None}
 
 
-def _footballlab_core(player):
-    """Football-LAB から 最新試合 と 出場区分 を取る
+def _footballlab_core(player, latest):
+    """Football-LAB から 最新試合 の出場区分 を取る
 
     メンバー表は試合当日から載る(後日更新されるのはタイムライン・シュート・CBP)。
     ベンチ外かベンチ入りかは、この表に名前があるかどうかでしか判別できない。
     戻り値の _fl キーに判定材料を入れ、呼び出し側で出場時間を補完する。
+    latest は呼び出し側で取得済みの fl_latest_match() の戻り値
+    (label, match_url, date) — チーム最新試合日付列と同じ取得を
+    二重に行わないよう、ここでは受け取るだけにする。
     """
-    label, match_url, date = fl_latest_match(player["url"])
+    label, match_url, date = latest
     html = fetch(match_url)
     save_html(html, f"{player['name_ja']}_fl_match")
     soup = BeautifulSoup(html, "lxml")
@@ -1025,14 +1031,15 @@ def scrape_espn(player):
 
     # 選手ページの Last 5 Matches がチームの最新試合を反映しているか確認する
     team_id = player.get("espn_team_id")
+    team_date = team_url = ""
     if team_id and date_str:
         try:
             team_date, team_url = espn_team_latest_result(team_id)
         except ScrapeError as e:
             log(f"チーム最新試合の確認に失敗: {e.summary()}", "WARN")
-            team_date = team_url = None
+            team_date = team_url = ""
         if team_date and team_date > date_str:
-            notes.append(f"要確認 チームの最新試合は{team_date}({team_url})")
+            notes.append("要確認 チームの最新試合と不一致")
             log(f"選手ページ({date_str})より新しいチーム試合({team_date})があります。"
                 f"未反映の可能性", "WARN")
         elif team_date:
@@ -1040,7 +1047,8 @@ def scrape_espn(player):
 
     row = result(player, res["status"], match=match["opponent"], date=date_str,
                  match_result=match["match_result"], goals=res["goals"],
-                 cards=res["cards"], url=match["url"], note=" / ".join(notes))
+                 cards=res["cards"], url=match["url"], note=" / ".join(notes),
+                 team_latest_date=team_date or "", team_latest_url=team_url or "")
     row["出場時間"] = minutes_text
     debug(f"判定経路: {res['via']}")
     return row
@@ -1097,6 +1105,13 @@ def describe_minutes(status, minutes, fl_minute):
     return ""
 
 
+def _with_team_latest(row, team_latest_date, team_latest_url):
+    """チーム最新試合日付/URLを行に付与する(FL/公式どちらの行でも共通)"""
+    row["チーム最新試合日付"] = team_latest_date
+    row["_team_latest_url"] = team_latest_url
+    return row
+
+
 def scrape_footballlab(player):
     """Football-LAB で出場区分を決め、足りない出場時間をJリーグ公式で補う
 
@@ -1104,9 +1119,11 @@ def scrape_footballlab(player):
     一方、交代の分数は後日更新のため、当日はJリーグ公式の出場試合時間を使う。
     """
     fallback = None if CFG.get("no_fallback") else player.get("jleague_url")
+
+    # チームの最新試合(=このシーズンでチーム公式が消化した最新日程)を
+    # 先に取得しておく。以降どの経路で行が確定しても同じ値を付与できる。
     try:
-        row = _footballlab_core(player)
-        member = row.pop("_fl", None)
+        latest = fl_latest_match(player["url"])
     except ScrapeError as e:
         if e.kind == "no_matches":
             # 今季まだ1試合も消化していない。Jリーグ公式に落とすと
@@ -1119,6 +1136,18 @@ def scrape_footballlab(player):
         jl = scrape_jleague(player, note_prefix="FL取得失敗のため ")
         jl["備考"] += " / ベンチ外は判別不可"
         return jl
+    team_latest_date, team_latest_url = latest[2], latest[1]
+
+    try:
+        row = _footballlab_core(player, latest)
+        member = row.pop("_fl", None)
+    except ScrapeError as e:
+        if not fallback:
+            raise
+        log(f"Football-LAB失敗({e.message}) → Jリーグ公式のみで判定します", "WARN")
+        jl = scrape_jleague(player, note_prefix="FL取得失敗のため ")
+        jl["備考"] += " / ベンチ外は判別不可"
+        return _with_team_latest(jl, team_latest_date, team_latest_url)
 
     # メンバー表が無い場合のみ、Jリーグ公式に丸ごと切り替える
     if member is None:
@@ -1128,17 +1157,17 @@ def scrape_footballlab(player):
             try:
                 jl = scrape_jleague(player, note_prefix="FLメンバー表未掲載のため ")
                 jl["備考"] += " / ベンチ外は判別不可"
-                return jl
+                return _with_team_latest(jl, team_latest_date, team_latest_url)
             except ScrapeError as e:
                 log(f"Jリーグ公式も失敗: {e.summary()}", "WARN")
                 row["備考"] = f"{row['備考']} / 公式も失敗".strip(" /")
-        return row
+        return _with_team_latest(row, team_latest_date, team_latest_url)
 
     status = row["ステータス"]
     # この2区分は個人成績が無いのが正常。公式の出場履歴による補完を
     # 試みないことで、行なし・取得失敗に起因する不要な警告を防ぐ。
     if status in (OUT_SQUAD, BENCH):
-        return row
+        return _with_team_latest(row, team_latest_date, team_latest_url)
 
     # 同日の公式出場履歴で、個人成績と試合結果を補完する。Football-LABは
     # 出場区分の判定に強く、公式はこの3項目に強いため役割を分ける。
@@ -1200,7 +1229,7 @@ def scrape_footballlab(player):
     row["出場時間"] = "フル出場" if fl_full else describe_minutes(status, minutes, fl_minute)
     if notes:
         row["備考"] = " / ".join([p for p in [row["備考"]] + notes if p])
-    return row
+    return _with_team_latest(row, team_latest_date, team_latest_url)
 
 
 # =========================================================
@@ -1394,7 +1423,9 @@ def excel_display_width(value):
     return width
 
 
-def format_excel(path):
+def format_excel(path, team_latest_urls=None):
+    """team_latest_urls: {0始まりのデータ行番号: URL} — 「チーム最新試合日付」列の
+    日付セルにハイパーリンクを張るための対応表。"""
     from openpyxl import load_workbook
     from openpyxl.styles import Alignment, Font, PatternFill
     from openpyxl.utils import get_column_letter
@@ -1424,6 +1455,17 @@ def format_excel(path):
                 continue
             max_width = max(max_width, excel_display_width(cell.value))
         ws.column_dimensions[get_column_letter(col_idx)].width = min(max(max_width + 2, 10), 80)
+
+    if team_latest_urls:
+        headers = [c.value for c in ws[1]]
+        if "チーム最新試合日付" in headers:
+            col_idx = headers.index("チーム最新試合日付") + 1
+            link_font = Font(color="0563C1", underline="single")
+            for row_i, url in team_latest_urls.items():
+                cell = ws.cell(row=row_i + 2, column=col_idx)
+                if cell.value and url:
+                    cell.hyperlink = url
+                    cell.font = link_font
 
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = ws.dimensions
@@ -1525,6 +1567,11 @@ def main():
         for c in COLUMNS:
             r.setdefault(c, "")
 
+    # 「チーム最新試合日付」列にハイパーリンクを張るための対応表
+    # (行番号は rows と df/Excel のデータ行が同じ並び順である前提)
+    team_latest_urls = {i: r["_team_latest_url"] for i, r in enumerate(rows)
+                        if r.get("_team_latest_url")}
+
     df = pd.DataFrame(rows, columns=COLUMNS)
     print("\n" + "=" * 78)
     print(f" 最新試合の出場状況  (集計日: {date.today():%Y-%m-%d})")
@@ -1556,7 +1603,7 @@ def main():
         if not args.no_excel:
             xlsx_path = f"{args.out}.xlsx"
             df.to_excel(xlsx_path, index=False)
-            format_excel(xlsx_path)
+            format_excel(xlsx_path, team_latest_urls)
             saved.append(xlsx_path)
         if not args.no_csv:
             csv_path = f"{args.out}.csv"
