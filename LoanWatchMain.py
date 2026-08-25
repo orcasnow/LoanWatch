@@ -1,8 +1,8 @@
 """LoanWatch - 名古屋グランパス レンタル移籍選手の最新試合 出場ステータス一覧
 
 出力: 選手ごと1行 (先発 / 途中出場 / ベンチ入りのみ / ベンチ外 / 試合なし)
-      ただしトップチームと U-21 Ｊリーグの両方に今季の出場履歴がある選手は
-      大会ごとに1行ずつ(=2行)出力する。
+      ただしトップチームのほかに U-21 Ｊリーグ・天皇杯にも今季の記録がある
+      選手は、大会ごとに1行ずつ出力する。
 
 準備:
     pip install playwright requests beautifulsoup4 lxml html5lib pandas openpyxl
@@ -21,7 +21,7 @@ GUI版:
 
 出力列:
     日付 / 経過 を先頭寄りに置き、いつの試合かがひと目で分かるようにしている。
-    リーグ名 はその試合の大会名(明治安田Ｊ１ / U-21 Ｊリーグ / ESPNは英語表記)。
+    リーグ名 はその試合の大会名(明治安田Ｊ１ / U-21 Ｊリーグ / 天皇杯 / ESPNは英語表記)。
     ベンチ外・ベンチ入りのみは大会名を特定できないため、Jリーグ公式の
     所属リーグで代用し、備考に「リーグ名は所属リーグから推定」と入れる。
     試合 は対戦相手のみ、試合結果 は対象クラブ視点の勝敗・スコア。
@@ -1161,9 +1161,39 @@ def scrape_footballlab(player):
         log(f"Football-LAB失敗({e.message}) → Jリーグ公式のみで判定します", "WARN")
         jl = scrape_jleague(player, note_prefix="FL取得失敗のため ")
         jl["備考"] += " / ベンチ外は判別不可"
-        return with_u21_row([jl], player, None)
+        return with_other_competitions([jl], player, None)
     row = jl_fill_league(_footballlab_row(player, latest), player)
-    return with_u21_row([row], player, latest[3])
+    return with_other_competitions([row], player, latest[3])
+
+
+def with_other_competitions(rows, player, season_start):
+    """トップチームのリーグ戦以外(U-21 Ｊリーグ・天皇杯)の行を足す"""
+    if CFG.get("no_fallback") or not player.get("jleague_url"):
+        return rows
+    return with_emperor_row(with_u21_row(rows, player, season_start),
+                            player, season_start)
+
+
+def with_emperor_row(rows, player, season_start):
+    """天皇杯の最新試合があれば行を足して返す
+
+    天皇杯はJFA主催のため、Jリーグ公式の出場履歴にも Football-LAB にも載らない。
+    クラブページの試合ログから今季の天皇杯を探し、試合ページのメンバー表で
+    出場区分を決める。メンバー表を見るのでベンチ外も判別できる。
+    """
+    try:
+        cup = jl_emperor_row(player, season_start)
+    except ScrapeError as e:
+        log(f"天皇杯の確認に失敗: {e.summary()}", "WARN")
+        return rows
+    if cup is None:
+        return rows
+    if any(r["日付"] == cup["日付"] and r["試合"] == cup["試合"] for r in rows):
+        debug("天皇杯の試合は1行目と同じなので追加しない")
+        return rows
+    log(f"天皇杯の出場記録を追加: {cup['日付']} {cup['ステータス']}")
+    rows.append(cup)
+    return rows
 
 
 def with_u21_row(rows, player, season_start):
@@ -1172,8 +1202,6 @@ def with_u21_row(rows, player, season_start):
     トップチームの行は Football-LAB のレポート(=リーグ戦・カップ戦)から作るため、
     U-21 Ｊリーグの出場はJリーグ公式の出場履歴からしか拾えない。
     """
-    if CFG.get("no_fallback") or not player.get("jleague_url"):
-        return rows
     try:
         df, _ = jl_history_df(player)
     except ScrapeError as e:
@@ -1328,8 +1356,10 @@ RE_JL_GAME_KIND = re.compile(
     r'gameKindName\\*"\s*:\s*\\*"(.*?)\\*"\s*,\s*\\*"gameKindId\\*"\s*:\s*(\d+)')
 
 # 同じ選手ページを何度も取りに行かないよう、1回の実行中は結果を使い回す
-# {URL: (出場履歴のDataFrame, 所属リーグ名)}
+# {選手ページURL: {"df": 出場履歴, "league": 所属リーグ名, "slug": クラブslug}}
 _JL_HISTORY_CACHE = {}
+# {クラブslug: クラブページの試合ログ} — 天皇杯の有無を調べるのに使う
+_JL_CLUB_CACHE = {}
 
 
 def jl_parse_date(text):
@@ -1463,13 +1493,17 @@ def jl_league_from_page(html, df):
     return name
 
 
-def jl_current_league(player):
-    """選手の現在の所属リーグ名。未取得なら選手ページを取りに行く"""
+def jl_page_value(player, key):
+    """選手ページから読んだ値(league / slug)。未取得なら選手ページを取りに行く"""
     url = player.get("jleague_url") or player.get("url")
     if url not in _JL_HISTORY_CACHE:
         jl_history_df(player)
-    cached = _JL_HISTORY_CACHE.get(url)
-    return cached[1] if cached else ""
+    return (_JL_HISTORY_CACHE.get(url) or {}).get(key, "")
+
+
+def jl_current_league(player):
+    """選手の現在の所属リーグ名"""
+    return jl_page_value(player, "league")
 
 
 def jl_fill_league(row, player):
@@ -1505,7 +1539,7 @@ def jl_history_df(player):
     url = player.get("jleague_url") or player.get("url")
     cached = _JL_HISTORY_CACHE.get(url)
     if cached is not None:
-        return cached[0].copy(), url
+        return cached["df"].copy(), url
 
     html = fetch(url)
     save_html(html, f"{player['name_ja']}_jleague")
@@ -1523,7 +1557,9 @@ def jl_history_df(player):
     date_col = find_col(df.columns, [JL_COL_DATE])
     df["_date"] = df[date_col].map(jl_parse_date)
     df = df.dropna(subset=["_date"]).sort_values("_date")
-    _JL_HISTORY_CACHE[url] = (df, jl_league_from_page(html, df))
+    _JL_HISTORY_CACHE[url] = {"df": df,
+                              "league": jl_league_from_page(html, df),
+                              "slug": jl_club_slug(html)}
     return df.copy(), url
 
 
@@ -1600,6 +1636,209 @@ def jl_u21_row(player, df, season_start):
                  url=player.get("jleague_url") or player.get("url"),
                  note="Jリーグ公式(U-21 Ｊリーグ) / ベンチ外は判別不可")
     row.update(jl_extra_fields(latest, df.columns))
+    row["出場時間"] = minutes_text
+    return row
+
+
+# =========================================================
+# 天皇杯 (Jリーグ公式のクラブページ + 試合ページ)
+#
+# 天皇杯はJFA主催のため、選手ページの出場履歴には載らない(2026年8月に確認)。
+# 代わりにクラブページへ全大会の試合ログが埋まっているので、そこから試合IDを
+# 取り出し、試合ページのメンバー表を読んで出場区分を決める。
+#
+#   クラブページ https://www.jleague.jp/club/<slug>/
+#     gameLogInClubByYear[<年>-<大会群>] = [{gameId, gameDate, leagueName, ...}]
+#   試合ページ   https://www.jleague.jp/match/emperor/<年>/<gameIdの下6桁>/
+#     homeTeam/awayTeam.players   先発11人(playerId付き)
+#     allMemberIds                両チームのメンバー入り全員 → ベンチ外の判別
+#     m-lineup-list-item の subs  交代の分数("68’")
+#     eventType goal/yellow-card  得点・警告(playerId付き)
+#
+# メンバー表はJリーグ公式が画面側で描画するため、DOMではなく埋め込みJSONを読む。
+# =========================================================
+EMPEROR = "天皇杯"
+JL_CLUB_URL = "https://www.jleague.jp/club/{slug}/"
+RE_JL_CLUB_SLUG = re.compile(r'clubId\\*"\s*:\s*\\*"([A-Za-z0-9_-]+)\\*"')
+RE_JL_PLAYER_ID = re.compile(r"/player/(\d+)")
+RE_JL_ALL_MEMBERS = re.compile(r'"allMemberIds"\s*:\s*(\[[^\]]*\])')
+RE_JL_LINEUP_SUBS = re.compile(
+    r'"m-lineup-list-item","ref":"[^"]*","subs":(\[[^\]]*\]).{0,400}?"memberId":"(\d+)"',
+    re.S)
+RE_JL_MATCH_EVENT = re.compile(
+    r'"eventType":"(goal|yellow-card|red-card)",'
+    r'"legacyPlayerPhotoLookup":\{[^}]*?"playerId":"(\d+)"')
+
+
+def jl_unescape(text):
+    """RSCストリーム(JSの文字列リテラル)内のエスケープを戻す"""
+    return text.replace('\\"', '"').replace("\\\\", "\\")
+
+
+def jl_json_after(text, key, open_ch="{"):
+    """key の直後にある JSON を括弧の対応で切り出して読む。読めなければ None"""
+    i = text.find(key)
+    if i < 0:
+        return None
+    start = text.find(open_ch, i + len(key))
+    if start < 0:
+        return None
+    close_ch = "}" if open_ch == "{" else "]"
+    depth = 0
+    for j in range(start, len(text)):
+        if text[j] == open_ch:
+            depth += 1
+        elif text[j] == close_ch:
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(text[start:j + 1])
+                except ValueError:
+                    return None
+    return None
+
+
+def jl_club_slug(html):
+    """選手ページからクラブのslug(例: gifu)を取り出す"""
+    m = RE_JL_CLUB_SLUG.search(html)
+    return m.group(1) if m else ""
+
+
+def jl_score_text(score):
+    """クラブページの scoreResult を '勝 3-1' / '負 2-2(PK4-5)' にする"""
+    if not isinstance(score, dict):
+        return ""
+    text = f"{score.get('label', '')} {score.get('score')}-{score.get('lost')}".strip()
+    pk = score.get("penalty") or {}
+    if pk:
+        text += f"(PK{pk.get('score')}-{pk.get('lost')})"
+    return text
+
+
+def jl_club_games(slug, name_ja=""):
+    """クラブページの試合ログ(全大会・全シーズン)を返す"""
+    if slug in _JL_CLUB_CACHE:
+        return _JL_CLUB_CACHE[slug]
+    url = JL_CLUB_URL.format(slug=slug)
+    html = fetch(url)
+    save_html(html, f"{name_ja or slug}_club")
+    by_year = jl_json_after(jl_unescape(html), '"gameLogInClubByYear"') or {}
+    games = []
+    for entries in by_year.values():
+        for g in entries:
+            games.append({"date": jl_parse_date(g.get("gameDate")),
+                          "league": str(g.get("leagueName") or ""),
+                          "opponent": str(g.get("opponentTeamShortName") or ""),
+                          "result": jl_score_text(g.get("scoreResult")),
+                          "game_id": str(g.get("gameId") or "")})
+    if not games:
+        debug(f"クラブページから試合ログを取得できない: {url}")
+    _JL_CLUB_CACHE[slug] = games
+    return games
+
+
+def jl_emperor_url(game_id):
+    """gameId 2026081917 → https://www.jleague.jp/match/emperor/2026/081917/"""
+    return f"https://www.jleague.jp/match/emperor/{game_id[:4]}/{game_id[4:]}/"
+
+
+def jl_match_members(html):
+    """試合ページから (先発ID, メンバーID全員, 交代情報, 得点・警告) を取り出す"""
+    plain = jl_unescape(html)
+
+    starters = set()
+    for side in ('"homeTeam":{"teamName"', '"awayTeam":{"teamName"'):
+        i = plain.find(side)
+        if i < 0:
+            continue
+        for p in jl_json_after(plain[i:], '"players"', "[") or []:
+            pid = (p.get("legacyPlayerPhotoLookup") or {}).get("playerId")
+            if pid:
+                starters.add(str(pid))
+
+    members = set()
+    m = RE_JL_ALL_MEMBERS.search(plain)
+    if m:
+        try:
+            members = {str(x) for x in json.loads(m.group(1))}
+        except ValueError:
+            debug("allMemberIds を JSON として読めなかった")
+
+    subs = {}
+    for mm in RE_JL_LINEUP_SUBS.finditer(plain):
+        try:
+            subs[mm.group(2)] = json.loads(mm.group(1))
+        except ValueError:
+            continue
+
+    events = {}
+    for kind, pid in RE_JL_MATCH_EVENT.findall(plain):
+        events.setdefault(pid, {"goal": 0, "yellow-card": 0, "red-card": 0})[kind] += 1
+
+    debug(f"試合ページ: 先発{len(starters)}人 メンバー{len(members)}人 "
+          f"交代{len(subs)}人分 得点・警告{len(events)}人分")
+    return starters, members, subs, events
+
+
+def jl_emperor_status(player_id, starters, members, subs):
+    """メンバー表から、その選手の出場区分と出場時間の表示を決める"""
+    events = subs.get(player_id) or []
+
+    def minute(kind):
+        for e in events:
+            if e.get("type") == kind:
+                m = re.search(r"(\d+)", str(e.get("time", "")))
+                return int(m.group(1)) if m else None
+        return None
+
+    if player_id in starters:
+        out = minute("out")
+        return STARTER, (f"先発〜{out}分で交代({out}分)" if out else "フル出場")
+    if player_id in members:
+        entry = minute("in")
+        if entry is None:
+            return BENCH, ""
+        minutes = max(90 - entry, 0)
+        _, label = minutes_to_entry(minutes)
+        return SUBBED_IN, (f"{label}から出場(約{minutes}分)" if label else f"約{minutes}分")
+    return OUT_SQUAD, ""
+
+
+def jl_emperor_row(player, season_start):
+    """今季の天皇杯の最新試合から、その選手の出場状況を1行にする。無ければ None"""
+    m = RE_JL_PLAYER_ID.search(player.get("jleague_url") or "")
+    slug = jl_page_value(player, "slug")
+    if not m or not slug:
+        debug("選手IDまたはクラブslugが取れないため天皇杯をスキップ")
+        return None
+    player_id = m.group(1)
+
+    # クラブページの試合ログは過去シーズン分も含むので、今季開幕以降に絞る
+    floor = season_start or date(CFG["year"], 1, 1)
+    cup = [g for g in jl_club_games(slug, player["name_ja"])
+           if EMPEROR in g["league"] and g["date"] and g["date"] >= floor and g["game_id"]]
+    if not cup:
+        debug(f"{CFG['year']}シーズンの天皇杯の試合は無し")
+        return None
+
+    latest = max(cup, key=lambda g: g["date"])
+    match_url = jl_emperor_url(latest["game_id"])
+    html = fetch(match_url)
+    save_html(html, f"{player['name_ja']}_emperor")
+    starters, members, subs, events = jl_match_members(html)
+    if not members:
+        raise ScrapeError("天皇杯の試合ページからメンバー表を取得できない",
+                          "--save-html でHTMLを保存し構造を確認する", match_url)
+
+    status, minutes_text = jl_emperor_status(player_id, starters, members, subs)
+    played = status in (STARTER, SUBBED_IN)
+    ev = events.get(player_id) or {}
+    row = result(player, status, match=latest["opponent"],
+                 date=latest["date"].strftime("%Y-%m-%d"),
+                 url=match_url, league=EMPEROR, match_result=latest["result"],
+                 goals=str(ev.get("goal", 0)) if played else "",
+                 cards=f"{ev.get('yellow-card', 0)}/{ev.get('red-card', 0)}" if played else "",
+                 note="Jリーグ公式(天皇杯)")
     row["出場時間"] = minutes_text
     return row
 
@@ -1775,6 +2014,7 @@ def main():
         return 1
 
     _JL_HISTORY_CACHE.clear()
+    _JL_CLUB_CACHE.clear()
     rows, errors, success = [], [], 0
     for p in targets:
         print(f"■ {p['name_ja']} ({p['club']}) [{p['source']}]")
