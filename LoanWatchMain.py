@@ -2,21 +2,20 @@
 
 出力: 選手ごと1行 (先発 / 途中出場 / ベンチ入りのみ / ベンチ外 / 試合なし)
 
-選手設定:
-    スクリプトと同じフォルダの players.json を読み込む
-    (LoanWatch.exe の「選手設定を編集」画面と共通のファイル)。
-    別の場所に置く場合は --players-file で指定する。
-
 準備:
     pip install playwright requests beautifulsoup4 lxml html5lib pandas openpyxl
     playwright install chromium
 
 実行:
-    python loanwatch.py
-    python loanwatch.py --year 2026 --debug
-    python loanwatch.py --headed --save-html          # 画面表示＋HTML保存
-    python loanwatch.py --only 貴田遼河 --debug        # 1人だけ試す
-    python loanwatch.py --source espn --debug         # ESPN対象の2人だけ
+    python LoanWatchMain.py
+    python LoanWatchMain.py --year 2026 --debug
+    python LoanWatchMain.py --headed --save-html          # 画面表示＋HTML保存
+    python LoanWatchMain.py --only 貴田遼河 --debug        # 1人だけ試す
+    python LoanWatchMain.py --source espn --debug         # ESPN対象の2人だけ
+
+GUI版:
+    python LoanWatchGui.py            # 実行設定・ログ画面＋「選手設定を編集」ボタン
+    python PlayersEditor.py           # players.json 編集画面を単体起動
 
 出力列:
     日付 / 経過 を先頭寄りに置き、いつの試合かがひと目で分かるようにしている。
@@ -27,6 +26,7 @@
 
 import argparse
 import asyncio
+import os
 import re
 import sys
 import time
@@ -38,10 +38,41 @@ from io import StringIO
 from pathlib import Path
 from urllib.parse import urljoin, urlparse, parse_qs
 
+
+def configure_system_cert_store():
+    if getattr(sys, "frozen", False):
+        return
+    try:
+        import truststore
+    except ImportError:
+        return
+    truststore.inject_into_ssl()
+
+
+configure_system_cert_store()
+
 import pandas as pd
 import requests
+import urllib3
 from bs4 import BeautifulSoup
+
+
+def configure_playwright_browsers():
+    if getattr(sys, "frozen", False):
+        bundle_dir = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+        os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(bundle_dir / "ms-playwright"))
+
+
+configure_playwright_browsers()
+
 from playwright.async_api import async_playwright
+
+
+def app_dir():
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
 
 # =========================================================
 # 定数
@@ -72,57 +103,34 @@ HEADERS = {
     "Referer": "https://www.google.com/",
 }
 
-# =========================================================
-# 選手マスタ (players.json から読み込む)
-#   LoanWatch.exe(GUI版)の「選手設定を編集」画面が書き込むファイルと共通。
-#   スクリプトと同じフォルダの players.json を既定で読む
-#   ({"players": [ {...}, {...} ]} 形式)。--players-file で変更可能。
-#
-#   source: "espn" | "transfermarkt" | "football-lab" | "manual"
-#   espn は Last 5 Matches の最新行 → 試合ページの lineUps を辿る。
-#     espn_id は選手ページURLの /id/<数字>/ の部分。
-#     espn_team に想定クラブ(英語表記の一部でよい)を書いておくと、
-#     ESPN側で移籍が未反映のときに備考へ「要確認」を出す。
-#     espn_team_id を書いておくと、チームの結果ページ
-#       (https://www.espn.com/soccer/team/results/_/id/<espn_team_id>)
-#     と突き合わせ、選手ページの Last 5 Matches がチームの最新試合より
-#     古い場合に備考へ「要確認」を出す(選手ページの反映遅れ検知用)。
-#   jleague_url を書いておくと、交代の分数を Jリーグ公式の
-#     「出場履歴」から補完する。Jリーグ公式で選手を検索し、
-#     URL の /player/<数字>/ をそのまま貼ればよい。
-#
-# 出場区分の判定方針:
-#   ベンチ外 / ベンチ入りのみ の区別は Football-LAB のメンバー表でしか付かない
-#   (Jリーグ公式の出場履歴には帯同しなかった試合の行が載らない)。
-#   一方 Football-LAB は交代の分数が後日更新なので、そこだけ公式で補う。
-#   transfermarkt は概要ページ(末尾 /plus/1)を指定する。
-#     そこから該当シーズンの大会別 試合ログへ自動で辿る。
-#   manual は latest に手入力した内容をそのまま出力する。
-# =========================================================
-PLAYERS_FILE = Path(__file__).resolve().parent / "players.json"
-
-
-def load_players(path=PLAYERS_FILE):
-    """players.json から選手マスタ(dictのリスト)を読み込む"""
-    path = Path(path)
-    if not path.exists():
-        raise ScrapeError(f"{path.name} が見つからない",
-                          f"{path} に選手設定ファイルを置く(LoanWatch.exeの"
-                          "「選手設定を編集」で作成・保存したものが使える)", str(path))
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as e:
-        raise ScrapeError(f"{path.name} の書式が不正: {e}",
-                          "JSON構文を確認する(壊れていればbackupファイルから戻す)",
-                          str(path))
-    players = data.get("players") if isinstance(data, dict) else None
-    if not isinstance(players, list) or not players:
-        raise ScrapeError(f"{path.name} に選手データが無い",
-                          '{"players": [...]} 形式になっているか確認', str(path))
-    return players
-
+# 選手マスタは players.json で管理する。
+# source: "espn" | "transfermarkt" | "football-lab" | "manual"
+# espn_id は ESPN 選手URLの /id/<数字>/、jleague_url は出場時間補完用。
+# espn_team_id を書いておくと、チームの結果ページ
+#   (https://www.espn.com/soccer/team/results/_/id/<espn_team_id>)
+# と突き合わせ、選手ページの Last 5 Matches がチームの最新試合より
+# 古い場合に備考へ「要確認」を出す(選手ページの反映遅れ検知用)。
+DEFAULT_PLAYERS_CONFIG = app_dir() / "players.json"
 
 CFG = {}  # main() で argparse の結果を格納
+
+
+def load_players(config_path):
+    with Path(config_path).open("r", encoding="utf-8") as f:
+        config = json.load(f)
+
+    players = config.get("players") if isinstance(config, dict) else config
+    if not isinstance(players, list):
+        raise ValueError("選手設定ファイルは players 配列、または選手配列そのものを指定してください")
+
+    required = {"name_ja", "club", "source", "url"}
+    for i, player in enumerate(players, start=1):
+        if not isinstance(player, dict):
+            raise ValueError(f"選手設定の {i} 件目がオブジェクトではありません")
+        missing = sorted(required - set(player))
+        if missing:
+            raise ValueError(f"選手設定の {i} 件目に必須項目がありません: {', '.join(missing)}")
+    return players
 
 
 # =========================================================
@@ -366,6 +374,23 @@ def render(url, wait_selector="table.items", locale="ja-JP", scroll=False):
                           "playwright install chromium を実行済みか確認", url)
 
 
+async def _playwright_smoke_test():
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        page = await browser.new_page()
+        try:
+            await page.set_content("<html><title>LoanWatch</title><body>OK</body></html>")
+            title = await page.title()
+            body = await page.text_content("body")
+            return title == "LoanWatch" and body == "OK"
+        finally:
+            await browser.close()
+
+
+def playwright_smoke_test():
+    return asyncio.run(_playwright_smoke_test())
+
+
 def tm_season_links(html, base_url, year):
     """概要ページから、表示シーズンが year の大会別 試合ログリンクを集める
 
@@ -469,11 +494,20 @@ SESSION = requests.Session()
 SESSION.headers.update(HEADERS)
 
 
+def session_get(url):
+    try:
+        return SESSION.get(url, timeout=CFG["timeout"])
+    except requests.exceptions.SSLError:
+        log("SSL証明書検証に失敗したため、検証を緩和して再取得します", "WARN")
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        return SESSION.get(url, timeout=CFG["timeout"], verify=False)
+
+
 def fetch(url):
     last = None
     for attempt in range(1, CFG["retry"] + 1):
         try:
-            r = SESSION.get(url, timeout=CFG["timeout"])
+            r = session_get(url)
         except requests.Timeout:
             last = ScrapeError(f"タイムアウト({CFG['timeout']}秒)", "--timeout を延ばす", url)
         except requests.ConnectionError as e:
@@ -1352,6 +1386,50 @@ SCRAPERS = {
 }
 
 
+def excel_display_width(value):
+    """Excel列幅の概算用。全角文字は2文字分として数える。"""
+    width = 0
+    for ch in str(value):
+        width += 2 if unicodedata.east_asian_width(ch) in ("F", "W", "A") else 1
+    return width
+
+
+def format_excel(path):
+    from openpyxl import load_workbook
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    wb = load_workbook(path)
+    ws = wb.active
+
+    header_fill = PatternFill("solid", fgColor="DDEBF7")
+    even_row_fill = PatternFill("solid", fgColor="F7F7F7")
+
+    for cell in ws[1]:
+        cell.fill = header_fill
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(vertical="center")
+
+    for row in ws.iter_rows(min_row=2):
+        if row[0].row % 2 == 0:
+            for cell in row:
+                cell.fill = even_row_fill
+        for cell in row:
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+
+    for col_idx, column_cells in enumerate(ws.columns, start=1):
+        max_width = 0
+        for cell in column_cells:
+            if cell.value is None:
+                continue
+            max_width = max(max_width, excel_display_width(cell.value))
+        ws.column_dimensions[get_column_letter(col_idx)].width = min(max(max_width + 2, 10), 80)
+
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+    wb.save(path)
+
+
 # =========================================================
 # メイン
 # =========================================================
@@ -1372,9 +1450,14 @@ def build_parser():
                     help="Football-LAB未更新時にJリーグ公式へ切り替えない")
     ap.add_argument("--stale-days", type=int, default=14, dest="stale_days",
                     help="この日数以上前の試合は注意表示する(既定: 14)")
+    ap.add_argument("--players-config", default=str(DEFAULT_PLAYERS_CONFIG),
+                    help="選手設定JSONファイル(既定: players.json)")
     ap.add_argument("--out", default="loan_players_latest", help="出力ファイル名(拡張子なし)")
-    ap.add_argument("--players-file", dest="players_file", default=None,
-                    help="選手設定ファイルのパス(既定: スクリプトと同じフォルダのplayers.json)")
+    ap.add_argument("--no-excel", action="store_true", dest="no_excel",
+                    help="Excelファイルを出力しない")
+    ap.add_argument("--no-csv", action="store_true", dest="no_csv",
+                    help="CSVファイルを出力しない")
+    ap.add_argument("--playwright-smoke-test", action="store_true", help=argparse.SUPPRESS)
     return ap
 
 
@@ -1382,13 +1465,23 @@ def main():
     args = build_parser().parse_args()
     CFG.update(vars(args))
 
-    players_file = Path(args.players_file) if args.players_file else PLAYERS_FILE
+    if args.playwright_smoke_test:
+        try:
+            ok = playwright_smoke_test()
+        except Exception as e:
+            print(f"PLAYWRIGHT_SMOKE_TEST_FAILED: {type(e).__name__}: {e}", file=sys.stderr)
+            return 1
+        print("PLAYWRIGHT_SMOKE_TEST_OK" if ok else "PLAYWRIGHT_SMOKE_TEST_FAILED")
+        return 0 if ok else 1
+
+    if args.no_excel and args.no_csv:
+        print("出力形式が選択されていません。Excel または CSV を有効にしてください", file=sys.stderr)
+        return 1
+
     try:
-        targets = load_players(players_file)
-    except ScrapeError as e:
-        print(f"選手設定の読み込みに失敗しました: {e.summary()}", file=sys.stderr)
-        if e.detail:
-            print(f"  {e.detail}", file=sys.stderr)
+        targets = load_players(args.players_config)
+    except (OSError, json.JSONDecodeError, ValueError) as e:
+        print(f"選手設定ファイルを読み込めません: {e}", file=sys.stderr)
         return 1
 
     if args.only:
@@ -1459,9 +1552,17 @@ def main():
         print(f"  - {name}: {msg}")
 
     try:
-        df.to_excel(f"{args.out}.xlsx", index=False)
-        df.to_csv(f"{args.out}.csv", index=False, encoding="utf-8-sig")
-        print(f"{args.out}.xlsx / .csv に保存しました")
+        saved = []
+        if not args.no_excel:
+            xlsx_path = f"{args.out}.xlsx"
+            df.to_excel(xlsx_path, index=False)
+            format_excel(xlsx_path)
+            saved.append(xlsx_path)
+        if not args.no_csv:
+            csv_path = f"{args.out}.csv"
+            df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+            saved.append(csv_path)
+        print(" / ".join(saved) + " に保存しました")
     except Exception as e:
         print(f"ファイル保存に失敗: {type(e).__name__}: {e}", file=sys.stderr)
         return 1

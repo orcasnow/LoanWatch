@@ -2,3 +2,7 @@
 loan_players_*.csv
 loan_players_*.xlsx
 __pycache__/
+backup/
+build/
+dist/
+.build-venv/
