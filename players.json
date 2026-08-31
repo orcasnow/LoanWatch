@@ -8,7 +8,18 @@
       "espn_id": "345269",
       "espn_team": "Argentinos",
       "espn_team_id": "3",
-      "url": "https://www.espn.com/soccer/player/_/id/345269/ryoga-kida"
+      "url": "https://www.espn.com/soccer/player/_/id/345269/ryoga-kida",
+      "besoccer": {
+        "url": "https://www.besoccer.com/player/matches/ryoga-kida-3237854",
+        "teams": [
+          {
+            "logo": "torneo-proyeccion",
+            "team": "Argentinos Juniors II",
+            "club": "AAアルヘンティノス・ジュニアーズII",
+            "league": "トルネオ・プロジェクシオン(リザーブリーグ)"
+          }
+        ]
+      }
     },
     {
       "name_ja": "倍井謙",

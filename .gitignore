@@ -7,3 +7,4 @@ build/
 dist/
 .build-venv/
 LoanWatch.exe
+cache/

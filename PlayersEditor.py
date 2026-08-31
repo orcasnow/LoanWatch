@@ -136,6 +136,7 @@ TABLE_COLUMNS = (
     "espn_team_id",
     "jleague_url",
     "url",
+    "besoccer",
 )
 
 HEADINGS = {
@@ -148,7 +149,17 @@ HEADINGS = {
     "espn_team_id": "ESPNチームID",
     "jleague_url": "JリーグURL",
     "url": "URL",
+    "besoccer": "BeSoccer追加チーム",
 }
+
+# BeSoccer(リザーブチームなどの追加行)の入力欄。players.json では
+#   "besoccer": {"url": ..., "teams": [{"logo","team","club","league"}, ...]}
+# という入れ子になるので、画面用に平らな bs_* として持ち、保存時に組み立てる。
+# 画面で編集できるのは teams の1件目だけで、2件目以降は元のJSONのまま残す。
+BESOCCER_FORM_FIELDS = ("bs_url", "bs_logo", "bs_team", "bs_club", "bs_league")
+BESOCCER_REQUIRED = (("bs_url", "BeSoccer選手URL"),
+                     ("bs_logo", "リーグロゴ名"),
+                     ("bs_team", "BeSoccerチーム名"))
 
 KNOWN_FORM_FIELDS = {
     "name_ja",
@@ -160,6 +171,7 @@ KNOWN_FORM_FIELDS = {
     "espn_team",
     "espn_team_id",
     "jleague_url",
+    *BESOCCER_FORM_FIELDS,
 }
 
 OUTPUT_FIELDS_BY_SOURCE = {
@@ -219,6 +231,13 @@ def load_players_config(path):
         return data, [dict(player) for player in data]
 
     raise ValueError("JSONのトップレベルはオブジェクトまたは配列である必要があります")
+
+
+def besoccer_summary(player):
+    """一覧表示用に besoccer 設定を 'ロゴ名: チーム名' の並びにする"""
+    teams = (player.get("besoccer") or {}).get("teams") or []
+    return " / ".join(f"{team.get('logo', '')}: {team.get('team', '')}"
+                      for team in teams if isinstance(team, dict))
 
 
 def build_output_data(original_data, players):
@@ -539,7 +558,7 @@ class PlayersEditor(tk.Tk):
             width = 120
             if column in ("url", "jleague_url"):
                 width = 260
-            elif column == "club":
+            elif column in ("club", "besoccer"):
                 width = 180
             self.tree.column(column, width=width, minwidth=80, stretch=True)
 
@@ -650,6 +669,7 @@ class PlayersEditor(tk.Tk):
             ttk.Entry(self.source_frame, textvariable=self.vars["jleague_url"]).grid(
                 row=1, column=1, columnspan=3, sticky="ew", padx=(0, 8), pady=4
             )
+            self.build_besoccer_fields(2)
             return
 
         if source == "espn":
@@ -676,6 +696,68 @@ class PlayersEditor(tk.Tk):
                 self.source_frame,
                 text="(espn.com/soccer/team/results/_/id/<ここ> 。空欄可、鮮度チェック用)",
             ).grid(row=1, column=2, columnspan=2, sticky="w", padx=(8, 4), pady=4)
+            self.build_besoccer_fields(2)
+
+    def build_besoccer_fields(self, row):
+        """BeSoccerから追加の1行を出すための任意項目を並べる
+
+        ESPN・Football-LAB はトップチームの記録しか持たないため、リザーブチーム
+        (例: アルヘンティノス・ジュニアーズII)の出場はここに書いて補う。
+        """
+        frame = ttk.LabelFrame(
+            self.source_frame,
+            text="BeSoccer(リザーブチームなどの行を追加する。すべて空欄なら使わない)",
+        )
+        frame.grid(row=row, column=0, columnspan=4, sticky="ew",
+                   padx=(8, 8), pady=(8, 4))
+        frame.columnconfigure(1, weight=1)
+        frame.columnconfigure(3, weight=1)
+
+        ttk.Label(frame, text="BeSoccer選手URL").grid(
+            row=0, column=0, sticky="w", padx=(8, 4), pady=4
+        )
+        ttk.Entry(frame, textvariable=self.vars["bs_url"]).grid(
+            row=0, column=1, columnspan=3, sticky="ew", padx=(0, 8), pady=4
+        )
+        ttk.Label(
+            frame,
+            text="(besoccer.com/player/matches/<選手> のURL)",
+        ).grid(row=1, column=0, columnspan=4, sticky="w", padx=(8, 4))
+
+        ttk.Label(frame, text="リーグロゴ名").grid(
+            row=2, column=0, sticky="w", padx=(8, 4), pady=4
+        )
+        ttk.Entry(frame, textvariable=self.vars["bs_logo"]).grid(
+            row=2, column=1, sticky="ew", padx=(0, 8), pady=4
+        )
+        ttk.Label(frame, text="BeSoccerチーム名").grid(
+            row=2, column=2, sticky="w", padx=(8, 4), pady=4
+        )
+        ttk.Entry(frame, textvariable=self.vars["bs_team"]).grid(
+            row=2, column=3, sticky="ew", padx=(0, 8), pady=4
+        )
+        ttk.Label(
+            frame,
+            text="(ロゴ名は試合一覧の行頭画像 league_logos/<ここ>.png "
+                 "例: torneo-proyeccion / チーム名は例: Argentinos Juniors II)",
+        ).grid(row=3, column=0, columnspan=4, sticky="w", padx=(8, 4))
+
+        ttk.Label(frame, text="クラブ表示名").grid(
+            row=4, column=0, sticky="w", padx=(8, 4), pady=4
+        )
+        ttk.Entry(frame, textvariable=self.vars["bs_club"]).grid(
+            row=4, column=1, sticky="ew", padx=(0, 8), pady=4
+        )
+        ttk.Label(frame, text="リーグ表示名").grid(
+            row=4, column=2, sticky="w", padx=(8, 4), pady=4
+        )
+        ttk.Entry(frame, textvariable=self.vars["bs_league"]).grid(
+            row=4, column=3, sticky="ew", padx=(0, 8), pady=4
+        )
+        ttk.Label(
+            frame,
+            text="(表示名は空欄可。出力の クラブ / リーグ名 列に出す日本語表記)",
+        ).grid(row=5, column=0, columnspan=4, sticky="w", padx=(8, 4), pady=(0, 4))
 
     def refresh_table(self):
         self.tree.delete(*self.tree.get_children())
@@ -685,6 +767,8 @@ class PlayersEditor(tk.Tk):
                 value = player.get(column, "")
                 if column == "source":
                     value = SOURCE_VALUE_TO_DISPLAY.get(value, value)
+                elif column == "besoccer":
+                    value = besoccer_summary(player)
                 values.append(value)
             self.tree.insert("", "end", iid=str(i), values=values)
         self.status_var.set(f"{len(self.players)} 件 / {self.config_path}")
@@ -702,11 +786,41 @@ class PlayersEditor(tk.Tk):
         self.loading_form = True
         for field in KNOWN_FORM_FIELDS:
             self.vars[field].set(str(player.get(field, "")))
+        self.populate_besoccer(player)
         self.source_display_var.set(
             SOURCE_VALUE_TO_DISPLAY.get(self.source_var.get(), "")
         )
         self.rebuild_source_fields()
         self.loading_form = False
+
+    def populate_besoccer(self, player):
+        """besoccer ブロックの1件目を bs_* の入力欄へ展開する"""
+        conf = player.get("besoccer") or {}
+        teams = [t for t in (conf.get("teams") or []) if isinstance(t, dict)]
+        first = teams[0] if teams else {}
+        self.vars["bs_url"].set(str(conf.get("url", "")))
+        self.vars["bs_logo"].set(str(first.get("logo", "")))
+        self.vars["bs_team"].set(str(first.get("team", "")))
+        self.vars["bs_club"].set(str(first.get("club", "")))
+        self.vars["bs_league"].set(str(first.get("league", "")))
+
+    def collect_besoccer(self, base):
+        """bs_* の入力欄を players.json の besoccer ブロックにする
+
+        画面で編集できるのは teams の1件目だけなので、2件目以降は元のまま残す。
+        """
+        values = {field: self.vars[field].get().strip()
+                  for field in BESOCCER_FORM_FIELDS}
+        if not any(values.values()):
+            return None
+        team = {"logo": values["bs_logo"], "team": values["bs_team"]}
+        if values["bs_club"]:
+            team["club"] = values["bs_club"]
+        if values["bs_league"]:
+            team["league"] = values["bs_league"]
+        rest = [t for t in ((base or {}).get("besoccer") or {}).get("teams", [])[1:]
+                if isinstance(t, dict)]
+        return {"url": values["bs_url"], "teams": [team] + rest}
 
     def clear_form(self):
         self.cancel_pending_search()
@@ -860,6 +974,10 @@ class PlayersEditor(tk.Tk):
             required_fields.append(("name_en", "選手名(英語)"))
             required_fields.append(("espn_id", "ESPN ID"))
         missing = [label for field, label in required_fields if not self.vars[field].get().strip()]
+        # BeSoccer欄は丸ごと空欄なら使わない。1つでも書いたら必須3項目をそろえる
+        if any(self.vars[field].get().strip() for field in BESOCCER_FORM_FIELDS):
+            missing += [label for field, label in BESOCCER_REQUIRED
+                        if not self.vars[field].get().strip()]
         if missing:
             messagebox.showerror(
                 "入力エラー",
@@ -873,16 +991,22 @@ class PlayersEditor(tk.Tk):
             return None
 
         source = self.source_var.get().strip()
+        # besoccer は最後に組み立て直すので、ここではいったん外しておく
         player = {
             key: value
             for key, value in (base or {}).items()
-            if key not in KNOWN_FORM_FIELDS
+            if key not in KNOWN_FORM_FIELDS and key != "besoccer"
         }
 
         for field in OUTPUT_FIELDS_BY_SOURCE.get(source, ()):
             value = source if field == "source" else self.vars[field].get().strip()
             if value:
                 player[field] = value
+
+        # BeSoccer欄をすべて空にして上書きすると、設定ごと消える
+        besoccer = self.collect_besoccer(base)
+        if besoccer:
+            player["besoccer"] = besoccer
         return player
 
     def add_player(self):

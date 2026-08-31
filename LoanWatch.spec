@@ -24,9 +24,12 @@ def conda_extra_binaries():
     # 見つけられないことがある(ビルド時の "Library not found" 警告で判明)。
     # 存在すれば明示的に同梱する。標準のpython.orgインストールでは
     # 通常見つからず、その場合は何もしない。
+    # libssl/libcrypto を外すと _ssl.pyd が読めず、EXEでHTTPS通信が
+    # "SSL module is not available" で全滅する。必ず入れる。
     bin_dir = os.path.join(sys.base_prefix, 'Library', 'bin')
     names = ('tcl86t.dll', 'tk86t.dll', 'ffi.dll', 'libexpat.dll',
-              'libmpdec-4.dll', 'liblzma.dll', 'libbz2.dll', 'sqlite3.dll')
+              'libmpdec-4.dll', 'liblzma.dll', 'libbz2.dll', 'sqlite3.dll',
+              'libssl-3-x64.dll', 'libcrypto-3-x64.dll')
     return [(os.path.join(bin_dir, n), '.') for n in names
             if os.path.isfile(os.path.join(bin_dir, n))]
 

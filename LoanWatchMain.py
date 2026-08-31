@@ -3,6 +3,9 @@
 出力: 選手ごと1行 (先発 / 途中出場 / ベンチ入りのみ / ベンチ外 / 試合なし)
       ただしトップチームのほかに U-21 Ｊリーグ・天皇杯にも今季の記録がある
       選手は、大会ごとに1行ずつ出力する。
+      players.json に besoccer 設定を書いた選手は、ESPN・Football-LAB に
+      載らないチーム(アルヘンティノス・ジュニアーズIIなどのリザーブチーム)の
+      行も BeSoccer から取得して追加する。
 
 準備:
     pip install playwright requests beautifulsoup4 lxml html5lib pandas openpyxl
@@ -14,6 +17,7 @@
     python LoanWatchMain.py --headed --save-html          # 画面表示＋HTML保存
     python LoanWatchMain.py --only 貴田遼河 --debug        # 1人だけ試す
     python LoanWatchMain.py --source espn --debug         # ESPN対象の2人だけ
+    python LoanWatchMain.py --no-besoccer                 # BeSoccerの追加行を出さない
 
 GUI版:
     python LoanWatchGui.py            # 実行設定・ログ画面＋「選手設定を編集」ボタン
@@ -36,6 +40,7 @@ import re
 import sys
 import time
 import traceback
+import hashlib
 import json
 import unicodedata
 from datetime import date, datetime
@@ -108,13 +113,37 @@ HEADERS = {
     "Referer": "https://www.google.com/",
 }
 
+# ヘッドレスChromiumは既定でクライアントヒントに "HeadlessChrome" と名乗る。
+# それを見てボット判定するサイト(BeSoccer)向けに、通常のChromeとして上書きする。
+# HEADERS["User-Agent"] のバージョンと揃えておくこと。
+CHROME_CLIENT_HINTS = {
+    "sec-ch-ua": '"Not;A=Brand";v="99", "Chromium";v="126", "Google Chrome";v="126"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+}
+
 # 選手マスタは players.json で管理する。
-# source: "espn" | "transfermarkt" | "football-lab" | "manual"
+# source: "espn" | "transfermarkt" | "football-lab" | "besoccer" | "manual"
 # espn_id は ESPN 選手URLの /id/<数字>/、jleague_url は出場時間補完用。
 # espn_team_id を書いておくと、チームの結果ページ
 #   (https://www.espn.com/soccer/team/results/_/id/<espn_team_id>)
 # と突き合わせ、選手ページの Last 5 Matches がチームの最新試合より
 # 古い場合に備考へ「要確認」を出す(選手ページの反映遅れ検知用)。
+#
+# besoccer は source と関係なく足せる任意項目で、ESPN・Football-LAB に
+# 載らないチーム(リザーブチームなど)の行を追加するために使う:
+#   "besoccer": {
+#     "url": "https://www.besoccer.com/player/matches/ryoga-kida-3237854",
+#     "teams": [
+#       {"logo":  "torneo-proyeccion",              ← リーグロゴのファイル名
+#        "team":  "Argentinos Juniors II",          ← BeSoccer上のチーム名
+#        "club":  "AAアルヘンティノス・ジュニアーズII", ← 出力の クラブ 列(任意)
+#        "league": "トルネオ・プロジェクシオン"}       ← 出力の リーグ名 列(任意)
+#     ]
+#   }
+# logo は選手ページの試合一覧で行頭に出るロゴ画像
+#   https://cdn.resfu.com/media/img/league_logos/<logo>.png?size=60x&lossy=1
+# のファイル名部分。これで大会(=どのチームでの出場か)を見分ける。
 DEFAULT_PLAYERS_CONFIG = app_dir() / "players.json"
 
 CFG = {}  # main() で argparse の結果を格納
@@ -135,7 +164,30 @@ def load_players(config_path):
         missing = sorted(required - set(player))
         if missing:
             raise ValueError(f"選手設定の {i} 件目に必須項目がありません: {', '.join(missing)}")
+        validate_besoccer(player, i)
     return players
+
+
+def validate_besoccer(player, i):
+    """任意項目 besoccer の形を確かめる(綴り違いを実行前に気付けるように)"""
+    conf = player.get("besoccer")
+    if conf is None:
+        return
+    where = f"選手設定の {i} 件目の besoccer"
+    if not isinstance(conf, dict):
+        raise ValueError(f"{where} はオブジェクトで書いてください")
+    if not str(conf.get("url", "")).strip():
+        raise ValueError(f"{where} に url がありません")
+    teams = conf.get("teams")
+    if not isinstance(teams, list) or not teams:
+        raise ValueError(f"{where} の teams は1件以上の配列で書いてください")
+    for j, team in enumerate(teams, start=1):
+        if not isinstance(team, dict):
+            raise ValueError(f"{where}.teams の {j} 件目がオブジェクトではありません")
+        lacking = [k for k in ("logo", "team") if not str(team.get(k, "")).strip()]
+        if lacking:
+            raise ValueError(f"{where}.teams の {j} 件目に必須項目がありません: "
+                             f"{', '.join(lacking)}")
 
 
 # =========================================================
@@ -329,14 +381,22 @@ def find_col(columns, keywords):
 # =========================================================
 # Transfermarkt (Playwright でレンダリング)
 # =========================================================
-async def _render(url, headless=True, wait_ms=6000,
-                  wait_selector="table.items", locale="ja-JP", scroll=False):
+async def _render(url, headless=True, wait_ms=6000, wait_selector="table.items",
+                  locale="ja-JP", scroll=False, as_chrome=False, state_path=None):
+    """as_chrome: 既定のヘッドレスChromiumだと名乗りが HeadlessChrome になり
+    ボット判定で弾かれるサイト(BeSoccer)向けに、通常のChromeとして名乗る
+    state_path: クッキーの保存先。次回以降も同じブラウザとして扱ってもらう"""
+    headers = {"Accept-Language": f"{locale},en;q=0.9"}
+    if as_chrome:
+        headers.update(CHROME_CLIENT_HINTS)
+    state = str(state_path) if state_path and Path(state_path).exists() else None
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=headless)
         ctx = await browser.new_context(
             locale=locale, timezone_id="Asia/Tokyo",
             viewport={"width": 1440, "height": 1000},
-            extra_http_headers={"Accept-Language": f"{locale},en;q=0.9"})
+            user_agent=HEADERS["User-Agent"] if as_chrome else None,
+            storage_state=state, extra_http_headers=headers)
         page = await ctx.new_page()
         try:
             resp = await page.goto(url, wait_until="domcontentloaded", timeout=60000)
@@ -344,6 +404,9 @@ async def _render(url, headless=True, wait_ms=6000,
             if status == 403:
                 raise ScrapeError("HTTP 403 アクセス拒否",
                                   "IPがボット判定された可能性。回線・実行環境を変える", url)
+            if status == 406:
+                raise ScrapeError("HTTP 406 ボット判定でブロック",
+                                  "時間をおいて再実行する。連続実行は控える", url)
             if status >= 400:
                 raise ScrapeError(f"HTTP {status}", "URL・選手IDを確認", url)
 
@@ -365,22 +428,48 @@ async def _render(url, headless=True, wait_ms=6000,
             if scroll:
                 await page.mouse.wheel(0, 3000)
                 await page.wait_for_timeout(2000)
-            return await page.content()
+            html = await page.content()
+            if state_path:
+                try:
+                    await ctx.storage_state(path=str(state_path))
+                except Exception as e:
+                    debug(f"クッキーを保存できません: {type(e).__name__}: {e}")
+            return html
         finally:
             await browser.close()
 
 
-def render(url, wait_selector="table.items", locale="ja-JP", scroll=False):
-    """_render を同期的に呼ぶラッパ"""
-    try:
-        return asyncio.run(_render(url, headless=not CFG["headed"],
-                                   wait_selector=wait_selector,
-                                   locale=locale, scroll=scroll))
-    except ScrapeError:
-        raise
-    except Exception as e:
-        raise ScrapeError(f"ブラウザ取得に失敗: {type(e).__name__}: {e}",
-                          "playwright install chromium を実行済みか確認", url)
+def render(url, wait_selector="table.items", locale="ja-JP", scroll=False,
+           as_chrome=False, state_path=None):
+    """_render を同期的に呼ぶラッパ
+
+    DNSや接続の一時的な失敗は fetch() と同じようにリトライする。
+    HTTP 403/406 などサイト側が意図して弾いた場合(ScrapeError)は繰り返さない。
+    """
+    last = None
+    for attempt in range(1, CFG["retry"] + 1):
+        try:
+            return asyncio.run(_render(url, headless=not CFG["headed"],
+                                       wait_selector=wait_selector,
+                                       locale=locale, scroll=scroll,
+                                       as_chrome=as_chrome, state_path=state_path))
+        except ScrapeError:
+            raise
+        except Exception as e:
+            last = e
+            if "Executable doesn't exist" in str(e):
+                # Playwrightのブラウザ本体がなければリトライしても解決しない。
+                command = f'"{sys.executable}" -m playwright install chromium'
+                raise ScrapeError(
+                    "Playwright Chromiumが見つかりません",
+                    f"次のコマンドを実行: {command}",
+                    url,
+                ) from e
+            if attempt < CFG["retry"]:
+                log(f"ブラウザ取得に失敗({type(e).__name__}) → {attempt}回目リトライ", "WARN")
+                time.sleep(CFG["sleep"] * 2)
+    raise ScrapeError(f"ブラウザ取得に失敗: {type(last).__name__}: {last}",
+                      f'"{sys.executable}" -m playwright install chromium を実行済みか確認', url)
 
 
 async def _playwright_smoke_test():
@@ -1871,6 +1960,469 @@ def scrape_jleague(player, note_prefix=""):
 
 
 # =========================================================
+# BeSoccer (リザーブチームなど、ESPN・Football-LAB に載らない大会)
+#
+# ESPN も Football-LAB もトップチームの記録しか持たないため、リザーブチームの
+# 出場(例: アルヘンティノス・ジュニアーズII のトルネオ・プロジェクシオン)は
+# BeSoccer の選手ページ /player/matches/<名前>-<選手ID> から拾う。
+# 1回の取得で直近100試合(全大会・全シーズン)が入っているので、大会が増えても
+# 追加のリクエストは要らない。
+#
+# 試合一覧の1行の構造(2026年8月に確認):
+#   <tr class="row-body">
+#     <td class="tiny"><img alt="Reserve League"
+#          src=".../league_logos/torneo-proyeccion.png?size=60x&lossy=1"></td>
+#     <td class="color-cell bg-match-res win|draw|lose">19 Aug</td>
+#     <td class="match-cell"><a class="match"
+#          href=".../match/ca-aldosivi-reservas/argentinos-juniors-reservas/2026347773">
+#          ALD <img alt="Aldosivi II"> 1-0 <img alt="Argentinos Juniors II"> ARG</a></td>
+#     <td class="tiny">46'</td>
+#     <td class="events-cell"><div class="img-ico event-18"></div></td>
+#   </tr>
+#
+# * 大会は行頭のリーグロゴのファイル名で見分ける。
+#   torneo-proyeccion = リザーブリーグ / apertura-argentina = トップチーム。
+# * 勝敗は日付セルの win/draw/lose クラスに対象選手のチーム視点で入っている。
+# * 日付セルに年が無いので、試合URL末尾のID先頭4桁(=開催年)から補う。
+# * 出場時間セルは 空欄=メンバー表に無い / 0'=ベンチ入りのみ / それ以外=出場分数。
+# * イベントアイコンの番号(event-<n>)は CSS スプライト sprite_events_new.png の
+#   表示位置から種別を確認した。1=ゴール 3=退場 4=警告2回で退場 5=警告
+#   18=交代OUT 19=交代IN 20=負傷。
+#
+# 同じ試合一覧が「イベントと得点」(#event)と「ポジションとELO」(#rating)の
+# 2タブ分あり、出場時間とイベントは #event 側にしか無い。
+# =========================================================
+BESOCCER = "BeSoccer"
+BS_GOAL, BS_RED, BS_SECOND_YELLOW, BS_YELLOW = "1", "3", "4", "5"
+BS_SUB_OUT, BS_SUB_IN, BS_INJURY = "18", "19", "20"
+
+RE_BS_LEAGUE_LOGO = re.compile(r"/league_logos/([^/.?]+)")
+RE_BS_MATCH_ID = re.compile(r"/(\d{4})\d+/?$")
+RE_BS_EVENT = re.compile(r"\bevent-(\d+)\b")
+RE_BS_DAY_MONTH = re.compile(r"(\d{1,2})\s*([A-Za-z]{3})")
+RE_BS_SCORE = re.compile(r"^(\d+)\s*-\s*(\d+)$")
+RE_BS_SCORE_PK = re.compile(r"^(\d+)\s*\((\d+)\s*-\s*(\d+)\)\s*(\d+)$")
+BS_MONTHS = {m: i for i, m in enumerate(
+    ("jan", "feb", "mar", "apr", "may", "jun",
+     "jul", "aug", "sep", "oct", "nov", "dec"), start=1)}
+
+# BeSoccer はボット対策が厳しく、ブラウザらしくないリクエストへは本文なしの
+# HTTP 406 を返す。requests は通ることも弾かれることもあるので、駄目なら
+# ESPN と同じ Playwright に切り替える。ただしヘッドレスChromiumは既定で
+# クライアントヒントに "HeadlessChrome" と名乗って弾かれるため、
+# as_chrome=True で通常のChromeとして名乗らせる。
+# 短時間に何度も叩くとCAPTCHA(Client Challenge)に飛ばされるので、
+# 1回の実行で選手ページは1度しか取りに行かない。
+BESOCCER_HEADERS = {
+    "User-Agent": HEADERS["User-Agent"],
+    "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+               "image/avif,image/webp,*/*;q=0.8"),
+    "Accept-Language": "en-US,en;q=0.9",
+    "sec-fetch-mode": "navigate",
+    "sec-fetch-dest": "document",
+    "sec-fetch-site": "none",
+    "upgrade-insecure-requests": "1",
+}
+BESOCCER_SESSION = requests.Session()
+BESOCCER_SESSION.headers.update(BESOCCER_HEADERS)
+RE_BS_CHALLENGE = re.compile(r"Client Challenge|_Incapsula_Resource|captcha", re.I)
+
+# 取得したHTMLとクッキーは cache/ に残す。
+# * HTML … ブロックされた回に前回分で行を出せるようにする(備考へ取得日時を入れる)。
+#           取り立てなら取りに行かないので、続けて実行してもアクセスは増えない。
+# * クッキー … 一度通ったブラウザとして扱ってもらい、再チャレンジを受けにくくする。
+BS_CACHE_DIR = app_dir() / "cache"
+BS_CACHE_FRESH_SEC = 30 * 60
+BS_STATE_PATH = BS_CACHE_DIR / "besoccer_cookies.json"
+_BS_HTML_CACHE = {}
+
+
+def besoccer_cache_path(url):
+    digest = hashlib.sha1(url.encode("utf-8")).hexdigest()[:12]
+    return BS_CACHE_DIR / f"besoccer_{digest}.html"
+
+
+def besoccer_cache_read(url):
+    """(HTML, 取得日時) を返す。まだ無ければ (None, None)"""
+    path = besoccer_cache_path(url)
+    try:
+        if not path.is_file():
+            return None, None
+        return (path.read_text(encoding="utf-8"),
+                datetime.fromtimestamp(path.stat().st_mtime))
+    except OSError as e:
+        debug(f"BeSoccerのキャッシュを読めません: {type(e).__name__}: {e}")
+        return None, None
+
+
+def besoccer_cache_write(url, html):
+    try:
+        BS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        besoccer_cache_path(url).write_text(html, encoding="utf-8")
+    except OSError as e:
+        debug(f"BeSoccerのキャッシュを書けません: {type(e).__name__}: {e}")
+
+
+def besoccer_load_cookies():
+    """保存済みのクッキーを requests 側にも読み込む(ブラウザ側は storage_state)"""
+    try:
+        state = json.loads(BS_STATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    for cookie in state.get("cookies", []):
+        if "besoccer" in str(cookie.get("domain", "")):
+            BESOCCER_SESSION.cookies.set(cookie.get("name"), cookie.get("value"),
+                                         domain=cookie.get("domain"),
+                                         path=cookie.get("path", "/"))
+    debug(f"BeSoccerのクッキーを{len(BESOCCER_SESSION.cookies)}件読み込みました")
+
+
+def besoccer_fetch(url):
+    """BeSoccerの選手ページを (HTML, キャッシュの取得日時) で返す
+
+    同じURLは1回の実行で1度しか取りに行かない。取り立てのキャッシュがあれば
+    それを使い、取りに行って弾かれた場合も前回分があればそちらで行を出す。
+    """
+    if url in _BS_HTML_CACHE:
+        debug(f"BeSoccerのHTMLは取得済み: {url}")
+        return _BS_HTML_CACHE[url]
+
+    cached, fetched_at = besoccer_cache_read(url)
+    if cached and (datetime.now() - fetched_at).total_seconds() < BS_CACHE_FRESH_SEC:
+        log(f"BeSoccerは{fetched_at:%m/%d %H:%M}に取得済みのため、そのまま使います")
+        return _BS_HTML_CACHE.setdefault(url, (cached, fetched_at))
+
+    try:
+        html = besoccer_download(url)
+    except ScrapeError as e:
+        if not cached:
+            raise
+        log(f"BeSoccerを取得できません({e.message}) → "
+            f"{fetched_at:%m/%d %H:%M}に取得した内容で行を出します", "WARN")
+        return _BS_HTML_CACHE.setdefault(url, (cached, fetched_at))
+
+    besoccer_cache_write(url, html)
+    return _BS_HTML_CACHE.setdefault(url, (html, None))
+
+
+def besoccer_download(url):
+    """BeSoccerの選手ページを取りに行く。弾かれたら ScrapeError"""
+    besoccer_load_cookies()
+    html = besoccer_get(url)
+    if html is None:
+        log("requestsでは取得できないためブラウザ経由に切り替えます", "WARN")
+        state_path = BS_STATE_PATH
+        try:
+            BS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            debug(f"cacheフォルダを作れないのでクッキーは保存しません: {e}")
+            state_path = None
+        html = render(url, wait_selector="tr.row-body", locale="en-US",
+                      as_chrome=True, state_path=state_path)
+    if RE_BS_CHALLENGE.search(html[:4000]):
+        raise ScrapeError("BeSoccerのボット確認ページ(CAPTCHA)が返ってきた",
+                          "時間をおいて再実行する。短時間に繰り返し実行しない", url)
+    return html
+
+
+def besoccer_get(url):
+    """requests で取れたらHTMLを返す。弾かれたら None
+
+    HTTP 406 はボット判定の結果なので、繰り返してもまず通らない。
+    無駄に叩くとブロックが強まるため、その場でブラウザ経由へ譲る。
+    """
+    for attempt in range(1, CFG["retry"] + 1):
+        try:
+            r = BESOCCER_SESSION.get(url, timeout=CFG["timeout"])
+        except requests.RequestException as e:
+            log(f"BeSoccer取得に失敗({type(e).__name__}: {e})", "WARN")
+        else:
+            if r.status_code == 404:
+                raise ScrapeError("HTTP 404 ページなし", "BeSoccerの選手URLを確認", url)
+            if r.status_code == 200 and len(r.text) >= 2000:
+                r.encoding = r.apparent_encoding
+                time.sleep(CFG["sleep"])
+                return r.text
+            log(f"BeSoccerがHTTP {r.status_code}を返しました(ボット判定)", "WARN")
+            if r.status_code == 406:
+                return None
+        if attempt < CFG["retry"]:
+            time.sleep(CFG["sleep"] * 2)
+    return None
+
+
+def besoccer_match_table(soup):
+    """出場時間とイベントアイコンが入っているタブ(#event)を選ぶ"""
+    panel = soup.select_one("div.pl-matches") or soup
+    for tab in panel.select("div.tab-content"):
+        if tab.select_one("td.events-cell"):
+            return tab
+    return panel.select_one("#event") or panel
+
+
+def besoccer_day_month(date_cell):
+    """'19 Aug' の日付セルを (日, 月) にする"""
+    if date_cell is None:
+        return None, None
+    m = RE_BS_DAY_MONTH.search(date_cell.get_text(" ", strip=True))
+    if not m:
+        return None, None
+    return int(m.group(1)), BS_MONTHS.get(m.group(2).lower())
+
+
+def besoccer_outcome(date_cell):
+    """日付セルの色クラスから、対象選手のチーム視点の勝敗を取り出す"""
+    classes = (date_cell.get("class") or []) if date_cell else []
+    return next((name for name in ("win", "draw", "lose") if name in classes), "")
+
+
+def besoccer_score(text):
+    """'1-0' / '1(5-4)1' を (ホーム得点, アウェー得点, PK表記) にする"""
+    m = RE_BS_SCORE.match(text)
+    if m:
+        return int(m.group(1)), int(m.group(2)), ""
+    m = RE_BS_SCORE_PK.match(text)
+    if m:
+        home, pk_home, pk_away, away = (int(g) for g in m.groups())
+        return home, away, f"(PK{pk_home}-{pk_away})"
+    return None, None, ""
+
+
+def besoccer_minutes(match_cell):
+    """出場時間セルを分数にする。ベンチ入りのみは 0、数字が無ければ None"""
+    cell = match_cell.find_next_sibling("td") if match_cell else None
+    return _to_minutes(cell.get_text(" ", strip=True)) if cell else None
+
+
+def besoccer_id_year(url):
+    """試合URL末尾のID先頭4桁(=開催年)を返す。読めなければ None"""
+    m = RE_BS_MATCH_ID.search(urlparse(url).path)
+    if not m:
+        return None
+    year = int(m.group(1))
+    return year if 1990 <= year <= date.today().year + 1 else None
+
+
+def besoccer_parse_rows(html, base_url):
+    """試合一覧を新しい順の辞書リストにする(年はまだ入っていない)"""
+    soup = BeautifulSoup(html, "lxml")
+    matches = []
+    for tr in besoccer_match_table(soup).select("tr.row-body"):
+        link = tr.select_one("a.match[href]")
+        match_cell = tr.select_one("td.match-cell")
+        # .image は行頭のリーグロゴと両チームのエンブレム(.shield)の両方に付く
+        logo = tr.select_one("td .image:not(.shield) img[src]")
+        date_cell = tr.select_one("td.bg-match-res")
+        if link is None or match_cell is None or logo is None:
+            continue
+        day, month = besoccer_day_month(date_cell)
+        if day is None or month is None:
+            debug(f"日付を読めない行を飛ばします: {tr.get_text(' ', strip=True)[:60]}")
+            continue
+        shields = [img.get("alt", "") for img in link.select("div.shield img")]
+        marker = link.select_one("div.marker-wrapper")
+        home_goals, away_goals, pk = besoccer_score(
+            marker.get_text(" ", strip=True) if marker else "")
+        events_cell = tr.select_one("td.events-cell")
+        logo_m = RE_BS_LEAGUE_LOGO.search(logo["src"])
+        url = urljoin(base_url, link["href"])
+        matches.append({
+            "logo": logo_m.group(1) if logo_m else "",
+            "league": logo.get("alt", "").strip(),
+            "day": day, "month": month, "date": None,
+            "url": url, "id_year": besoccer_id_year(url),
+            "home": shields[0] if len(shields) > 0 else "",
+            "away": shields[1] if len(shields) > 1 else "",
+            "home_goals": home_goals, "away_goals": away_goals, "pk": pk,
+            "outcome": besoccer_outcome(date_cell),
+            "minutes": besoccer_minutes(match_cell),
+            "events": RE_BS_EVENT.findall(str(events_cell)) if events_cell else [],
+        })
+    return matches
+
+
+def besoccer_fill_years(matches):
+    """各行に年を入れ、日付を決められた行だけ返す
+
+    日付セルに年が無いため、まず試合IDの先頭4桁を使う。読めない行は、
+    一覧が新しい順に並んでいることを利用して、月が増えたら年を1つ戻す。
+    """
+    year = next((m["id_year"] for m in matches if m["id_year"]), date.today().year)
+    prev_month = None
+    for m in matches:
+        if m["id_year"]:
+            year = m["id_year"]
+        elif prev_month is not None and m["month"] > prev_month:
+            year -= 1
+        try:
+            m["date"] = date(year, m["month"], m["day"])
+        except ValueError:
+            debug(f"日付にできない組み合わせ: {year}-{m['month']}-{m['day']}")
+        prev_month = m["month"]
+    return [m for m in matches if m["date"]]
+
+
+def besoccer_side(match, team):
+    """対象クラブがホームかアウェーかを返す。判別できなければ None"""
+    want = norm(team).casefold()
+    names = (("home", norm(match["home"]).casefold()),
+             ("away", norm(match["away"]).casefold()))
+    if not want:
+        return None
+    for side, name in names:
+        if name == want:
+            return side
+    for side, name in names:
+        if name and (want in name or name in want):
+            return side
+    return None
+
+
+def besoccer_result_text(match, side):
+    """対象クラブ視点の '勝 3-0' / '分 1-1(PK5-4)' を作る"""
+    if match["home_goals"] is None or side is None:
+        return ""
+    scored, conceded = ((match["home_goals"], match["away_goals"]) if side == "home"
+                        else (match["away_goals"], match["home_goals"]))
+    outcome = {"win": "勝", "draw": "分", "lose": "敗"}.get(match["outcome"])
+    if outcome is None:
+        outcome = "勝" if scored > conceded else "敗" if scored < conceded else "分"
+    return f"{outcome} {scored}-{conceded}{match['pk']}"
+
+
+def besoccer_status(match):
+    """出場時間セルとイベントアイコンから出場区分と出場時間表示を決める"""
+    minutes, events = match["minutes"], match["events"]
+    if minutes is None:
+        # メンバー表に載っていない。BeSoccerは招集外と未掲載を区別しない
+        return OUT_SQUAD, ""
+    if minutes <= 0:
+        return BENCH, ""
+    status = SUBBED_IN if BS_SUB_IN in events else STARTER
+    return status, describe_minutes(status, minutes, None)
+
+
+def besoccer_row(player, team_conf, match, fetched_at=None):
+    """BeSoccerの1試合をExcelの1行にする
+
+    fetched_at が入っているときは、この実行で取り直せずキャッシュを使ったという
+    ことなので、いつ時点の内容かが分かるように備考へ出す。
+    """
+    team = str(team_conf.get("team", "")).strip()
+    side = besoccer_side(match, team)
+    opponent = match["away"] if side == "home" else match["home"] if side == "away" else ""
+    status, minutes_text = besoccer_status(match)
+
+    notes = [BESOCCER if fetched_at is None
+             else f"{BESOCCER}({fetched_at:%m/%d %H:%M}取得)"]
+    if side is None:
+        notes.append(f"要確認 チーム名が一致しない({match['home']} / {match['away']})")
+        log(f"BeSoccerの対戦カードに '{team}' が見つかりません", "WARN")
+    if status == OUT_SQUAD:
+        notes.append("出場データなし(招集外とデータ未掲載は区別できない)")
+    if BS_INJURY in match["events"]:
+        notes.append("負傷")
+
+    row = result(player, status, match=opponent,
+                 date=match["date"].strftime("%Y-%m-%d"),
+                 url=match["url"], note=" / ".join(notes),
+                 match_result=besoccer_result_text(match, side),
+                 goals=str(match["events"].count(BS_GOAL)),
+                 cards=(f"{match['events'].count(BS_YELLOW)}/"
+                        f"{match['events'].count(BS_RED) + match['events'].count(BS_SECOND_YELLOW)}"),
+                 league=str(team_conf.get("league", "")).strip() or match["league"])
+    row["クラブ"] = str(team_conf.get("club", "")).strip() or player["club"]
+    row["出場時間"] = minutes_text
+    return row
+
+
+def besoccer_blank_row(player, team_conf, note):
+    """試合を取れなかったチームの行を 試合なし で作る
+
+    黙って行を消すと、設定漏れなのか取得失敗なのか画面から分からなくなる。
+    """
+    row = blank(player, NO_MATCH, f"{BESOCCER} / {note}")
+    row["クラブ"] = str(team_conf.get("club", "")).strip() or player["club"]
+    row["リーグ名"] = str(team_conf.get("league", "")).strip()
+    return row
+
+
+def besoccer_blank_rows(player, note):
+    """設定してある全チーム分の 試合なし 行を作る(取得そのものが失敗したとき)"""
+    return [besoccer_blank_row(player, team_conf, note)
+            for team_conf in (player.get("besoccer") or {}).get("teams") or []]
+
+
+def besoccer_rows(player):
+    """players.json の besoccer 設定にあるチームごとに、今季の最新試合を1行ずつ作る"""
+    conf = player.get("besoccer") or {}
+    url = str(conf.get("url", "")).strip()
+    teams = list(conf.get("teams") or [])
+    if not url or not teams:
+        return []
+
+    html, fetched_at = besoccer_fetch(url)
+    matches = besoccer_fill_years(besoccer_parse_rows(html, url))
+    if not matches:
+        raise ScrapeError("BeSoccerの試合一覧を読めない",
+                          "--save-html でHTMLを保存し表構造を確認する", url)
+    debug(f"BeSoccerの試合一覧 {len(matches)}件 "
+          f"({matches[-1]['date']} 〜 {matches[0]['date']})")
+
+    season_start = date(CFG["year"], 1, 1)
+    rows = []
+    for team_conf in teams:
+        logo = str(team_conf.get("logo", "")).strip()
+        target = [m for m in matches if m["logo"] == logo and m["date"] >= season_start]
+        if not target:
+            log(f"BeSoccer: ロゴ {logo} の{CFG['year']}年の試合が0件", "WARN")
+            rows.append(besoccer_blank_row(
+                player, team_conf,
+                f"{CFG['year']}年の試合が0件(リーグロゴ名 {logo} を確認)"))
+            continue
+        rows.append(besoccer_row(player, team_conf,
+                                 max(target, key=lambda m: m["date"]), fetched_at))
+    return rows
+
+
+def with_besoccer_rows(rows, player):
+    """BeSoccer側の大会の行を足して返す
+
+    トップチーム側の行は必ず残す。BeSoccerが取れなかった場合も、設定して
+    あるチームの行は 試合なし で出し、理由を備考に書く。行が黙って消えると
+    設定漏れなのか取得失敗なのか画面から判断できないため。
+    """
+    if CFG.get("no_besoccer") or player.get("source") == "besoccer" \
+            or not player.get("besoccer"):
+        return rows
+    try:
+        extra = besoccer_rows(player)
+    except ScrapeError as e:
+        log(f"BeSoccerの確認に失敗: {e.summary()}", "WARN")
+        extra = besoccer_blank_rows(player, e.summary())
+    except Exception as e:
+        log(f"BeSoccerの確認に失敗: {type(e).__name__}: {e}", "WARN")
+        extra = besoccer_blank_rows(player, f"{type(e).__name__}: {e}")
+    for row in extra:
+        # 日付が入っている行だけ重複判定する(試合なしの行は日付も試合も空)
+        if row["日付"] and any(r["日付"] == row["日付"] and r["試合"] == row["試合"]
+                              for r in rows):
+            debug(f"BeSoccerの{row['リーグ名']}は既存の行と同じなので追加しない")
+            continue
+        log(f"BeSoccerの出場記録を追加: {row['リーグ名'] or '大会不明'} "
+            f"{row['日付'] or '日付なし'} {row['ステータス']}")
+        rows.append(row)
+    return rows
+
+
+def scrape_besoccer(player):
+    """source が besoccer の選手。BeSoccerの設定だけで全行を作る"""
+    if not player.get("besoccer"):
+        return blank(player, NO_MATCH, "besoccer だが besoccer 設定が未記入")
+    return besoccer_rows(player)
+
+
+# =========================================================
 # manual (手入力)
 # =========================================================
 def scrape_manual(player):
@@ -1889,6 +2441,7 @@ SCRAPERS = {
     "jleague": scrape_jleague,
     "transfermarkt": scrape_transfermarkt,
     "football-lab": scrape_footballlab,
+    "besoccer": scrape_besoccer,
     "manual": scrape_manual,
 }
 
@@ -1968,6 +2521,8 @@ def build_parser():
                     help="取得したHTMLをファイル保存")
     ap.add_argument("--no-fallback", action="store_true", dest="no_fallback",
                     help="Football-LAB未更新時にJリーグ公式へ切り替えない")
+    ap.add_argument("--no-besoccer", action="store_true", dest="no_besoccer",
+                    help="players.json の besoccer 設定を無視し、追加の行を出さない")
     ap.add_argument("--stale-days", type=int, default=14, dest="stale_days",
                     help="この日数以上前の試合は注意表示する(既定: 14)")
     ap.add_argument("--players-config", default=str(DEFAULT_PLAYERS_CONFIG),
@@ -2015,6 +2570,7 @@ def main():
 
     _JL_HISTORY_CACHE.clear()
     _JL_CLUB_CACHE.clear()
+    _BS_HTML_CACHE.clear()
     rows, errors, success = [], [], 0
     for p in targets:
         print(f"■ {p['name_ja']} ({p['club']}) [{p['source']}]")
@@ -2024,26 +2580,32 @@ def main():
             rows.append(blank(p, NO_MATCH, f"未対応source: {p['source']}"))
             errors.append((p["name_ja"], f"未対応source: {p['source']}"))
             continue
+        failed = None
         try:
             # スクレイパは1行(dict)、または大会ごとの複数行(list)を返す
             res = scraper(p)
-            for r in (res if isinstance(res, list) else [res]):
-                log(f"{r['リーグ名'] or '大会不明'} / {r['ステータス']} "
-                    f"{r['出場時間']} ({r['日付']})")
-                rows.append(r)
+            player_rows = list(res) if isinstance(res, list) else [res]
             success += 1
         except ScrapeError as e:
             log(e.summary(), "ERROR")
             if e.detail:
                 print(f"     {e.detail}")
-            rows.append(blank(p, NO_MATCH, e.summary()))
+            failed = blank(p, NO_MATCH, e.summary())
             errors.append((p["name_ja"], e.summary()))
         except Exception as e:
             log(f"想定外のエラー: {type(e).__name__}: {e}", "ERROR")
             if args.debug:
                 traceback.print_exc()
-            rows.append(blank(p, NO_MATCH, f"{type(e).__name__}: {e}"))
+            failed = blank(p, NO_MATCH, f"{type(e).__name__}: {e}")
             errors.append((p["name_ja"], f"{type(e).__name__}: {e}"))
+
+        # BeSoccer は別サイトなので、トップチーム側が失敗しても独立して取りに行く
+        player_rows = with_besoccer_rows([failed] if failed else player_rows, p)
+        for r in player_rows:
+            if r is not failed:
+                log(f"{r['リーグ名'] or '大会不明'} / {r['ステータス']} "
+                    f"{r['出場時間']} ({r['日付']})")
+            rows.append(r)
 
     # どのスクレイパ経由でも 経過 列が欠けないよう、日付から再計算する
     for r in rows:
