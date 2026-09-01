@@ -1999,18 +1999,17 @@ BS_MONTHS = {m: i for i, m in enumerate(
 # 1回の実行で選手ページは1度しか取りに行かない。
 RE_BS_CHALLENGE = re.compile(r"Client Challenge|_Incapsula_Resource|captcha|incapsula|imperva", re.I)
 
-# 取得したHTMLとBeSoccer専用Chromeプロファイルは cache/ に残す。
+# 取得したHTMLは cache/ に残す。
 # * HTML … ブロックされた回に前回分で行を出せるようにする(備考へ取得日時を入れる)。
 #           取り立てなら取りに行かないので、続けて実行してもアクセスは増えない。
-# * profile … Cookie / Local Storage等を含むブラウザ状態を継続利用する。
 # * diagnostics … --debug時に403/406/CAPTCHA等の原因調査材料を保存する。
 #   Cookie/Authorization/Storageの「値」は保存せず、Cookie名・Storageキー名だけ残す。
 BS_CACHE_DIR = app_dir() / "cache"
 BS_CACHE_FRESH_SEC = 30 * 60
-# 実Chrome用の既存プロファイルは互換性維持のため従来名を継続使用する。
-# フォールバックするPlaywright Chromiumはブラウザ世代差によるプロファイル破損を避けるため別ディレクトリにする。
-BS_PROFILE_DIR = BS_CACHE_DIR / "besoccer_profile"
-BS_CHROMIUM_PROFILE_DIR = BS_CACHE_DIR / "besoccer_profile_chromium"
+# BeSoccer専用のPersistent Profile。Cookie / Local Storage等を実行をまたいで再利用する。
+# Playwright ChromiumはChromeと同じプロファイルを共有できないため、フォールバック時だけ子ディレクトリを使う。
+BS_PROFILE_DIR = Path(os.environ.get("LOCALAPPDATA", app_dir())) / "LoanWatch"
+BS_CHROMIUM_PROFILE_DIR = BS_PROFILE_DIR / "chromium"
 BS_DIAG_DIR = BS_CACHE_DIR / "besoccer_diagnostics"
 _BS_HTML_CACHE = {}
 
@@ -2410,7 +2409,7 @@ async def _bs_save_diagnostics(page, ctx, requested_url, response, reason,
         "requested_url": _bs_safe_url(requested_url),
         "final_url": _bs_safe_url(final_url),
         "title": title,
-        "headless": not CFG.get("headed", False),
+        "headless": False,
         "channel": browser_channel,
         "browser_source": browser_source,
         "profile_dir": str(profile_dir or BS_PROFILE_DIR),
@@ -2527,7 +2526,7 @@ async def _render_besoccer(url):
             ctx = await pw.chromium.launch_persistent_context(
                 user_data_dir=str(profile_dir),
                 channel="chrome",
-                headless=not CFG["headed"],
+                headless=False,
                 locale="en-US",
                 timezone_id="Asia/Tokyo",
                 viewport={"width": 1440, "height": 1000},
@@ -2555,7 +2554,7 @@ async def _render_besoccer(url):
             except OSError as e:
                 raise ScrapeError(
                     "BeSoccer用Chromiumプロファイルを作成できません",
-                    "cacheフォルダへの書き込み権限を確認",
+                    "%LOCALAPPDATA%\\LoanWatch への書き込み権限を確認",
                     str(profile_dir),
                 ) from e
             profile_before = _bs_profile_summary(profile_dir)
@@ -2564,7 +2563,7 @@ async def _render_besoccer(url):
                 ctx = await pw.chromium.launch_persistent_context(
                     user_data_dir=str(profile_dir),
                     channel="chromium",
-                    headless=not CFG["headed"],
+                    headless=False,
                     locale="en-US",
                     timezone_id="Asia/Tokyo",
                     viewport={"width": 1440, "height": 1000},
