@@ -113,15 +113,6 @@ HEADERS = {
     "Referer": "https://www.google.com/",
 }
 
-# ヘッドレスChromiumは既定でクライアントヒントに "HeadlessChrome" と名乗る。
-# それを見てボット判定するサイト(BeSoccer)向けに、通常のChromeとして上書きする。
-# HEADERS["User-Agent"] のバージョンと揃えておくこと。
-CHROME_CLIENT_HINTS = {
-    "sec-ch-ua": '"Not;A=Brand";v="99", "Chromium";v="126", "Google Chrome";v="126"',
-    "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-platform": '"Windows"',
-}
-
 # 選手マスタは players.json で管理する。
 # source: "espn" | "transfermarkt" | "football-lab" | "besoccer" | "manual"
 # espn_id は ESPN 選手URLの /id/<数字>/、jleague_url は出場時間補完用。
@@ -382,21 +373,19 @@ def find_col(columns, keywords):
 # Transfermarkt (Playwright でレンダリング)
 # =========================================================
 async def _render(url, headless=True, wait_ms=6000, wait_selector="table.items",
-                  locale="ja-JP", scroll=False, as_chrome=False, state_path=None):
-    """as_chrome: 既定のヘッドレスChromiumだと名乗りが HeadlessChrome になり
-    ボット判定で弾かれるサイト(BeSoccer)向けに、通常のChromeとして名乗る
-    state_path: クッキーの保存先。次回以降も同じブラウザとして扱ってもらう"""
+                  locale="ja-JP", scroll=False):
+    """PlaywrightでページをレンダリングしてHTMLを返す。
+
+    サイト固有のUser-AgentやClient Hintsの偽装は行わず、Playwrightが
+    起動したブラウザ自身の値をそのまま利用する。
+    """
     headers = {"Accept-Language": f"{locale},en;q=0.9"}
-    if as_chrome:
-        headers.update(CHROME_CLIENT_HINTS)
-    state = str(state_path) if state_path and Path(state_path).exists() else None
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=headless)
         ctx = await browser.new_context(
             locale=locale, timezone_id="Asia/Tokyo",
             viewport={"width": 1440, "height": 1000},
-            user_agent=HEADERS["User-Agent"] if as_chrome else None,
-            storage_state=state, extra_http_headers=headers)
+            extra_http_headers=headers)
         page = await ctx.new_page()
         try:
             resp = await page.goto(url, wait_until="domcontentloaded", timeout=60000)
@@ -428,20 +417,13 @@ async def _render(url, headless=True, wait_ms=6000, wait_selector="table.items",
             if scroll:
                 await page.mouse.wheel(0, 3000)
                 await page.wait_for_timeout(2000)
-            html = await page.content()
-            if state_path:
-                try:
-                    await ctx.storage_state(path=str(state_path))
-                except Exception as e:
-                    debug(f"クッキーを保存できません: {type(e).__name__}: {e}")
-            return html
+            return await page.content()
         finally:
             await browser.close()
 
 
-def render(url, wait_selector="table.items", locale="ja-JP", scroll=False,
-           as_chrome=False, state_path=None):
-    """_render を同期的に呼ぶラッパ
+def render(url, wait_selector="table.items", locale="ja-JP", scroll=False):
+    """_render を同期的に呼ぶラッパ。
 
     DNSや接続の一時的な失敗は fetch() と同じようにリトライする。
     HTTP 403/406 などサイト側が意図して弾いた場合(ScrapeError)は繰り返さない。
@@ -451,8 +433,7 @@ def render(url, wait_selector="table.items", locale="ja-JP", scroll=False,
         try:
             return asyncio.run(_render(url, headless=not CFG["headed"],
                                        wait_selector=wait_selector,
-                                       locale=locale, scroll=scroll,
-                                       as_chrome=as_chrome, state_path=state_path))
+                                       locale=locale, scroll=scroll))
         except ScrapeError:
             raise
         except Exception as e:
@@ -2006,34 +1987,21 @@ BS_MONTHS = {m: i for i, m in enumerate(
     ("jan", "feb", "mar", "apr", "may", "jun",
      "jul", "aug", "sep", "oct", "nov", "dec"), start=1)}
 
-# BeSoccer はボット対策が厳しく、ブラウザらしくないリクエストへは本文なしの
-# HTTP 406 を返す。requests は通ることも弾かれることもあるので、駄目なら
-# ESPN と同じ Playwright に切り替える。ただしヘッドレスChromiumは既定で
-# クライアントヒントに "HeadlessChrome" と名乗って弾かれるため、
-# as_chrome=True で通常のChromeとして名乗らせる。
-# 短時間に何度も叩くとCAPTCHA(Client Challenge)に飛ばされるので、
+# BeSoccer はボット対策が厳しいため、requestsを先に投げて失敗後に
+# Playwrightへ切り替える方式は使わない。最初から通常のGoogle Chromeを
+# Persistent Contextで起動し、同じ専用プロファイルを継続利用する。
+# User-Agent / Client Hintsは固定値で上書きせず、実Chrome自身の値を使用する。
+# 短時間に何度も叩くとCAPTCHA(Client Challenge)に飛ばされることがあるため、
 # 1回の実行で選手ページは1度しか取りに行かない。
-BESOCCER_HEADERS = {
-    "User-Agent": HEADERS["User-Agent"],
-    "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
-               "image/avif,image/webp,*/*;q=0.8"),
-    "Accept-Language": "en-US,en;q=0.9",
-    "sec-fetch-mode": "navigate",
-    "sec-fetch-dest": "document",
-    "sec-fetch-site": "none",
-    "upgrade-insecure-requests": "1",
-}
-BESOCCER_SESSION = requests.Session()
-BESOCCER_SESSION.headers.update(BESOCCER_HEADERS)
 RE_BS_CHALLENGE = re.compile(r"Client Challenge|_Incapsula_Resource|captcha", re.I)
 
-# 取得したHTMLとクッキーは cache/ に残す。
+# 取得したHTMLとBeSoccer専用Chromeプロファイルは cache/ に残す。
 # * HTML … ブロックされた回に前回分で行を出せるようにする(備考へ取得日時を入れる)。
 #           取り立てなら取りに行かないので、続けて実行してもアクセスは増えない。
-# * クッキー … 一度通ったブラウザとして扱ってもらい、再チャレンジを受けにくくする。
+# * profile … Cookie / Local Storage等を含むブラウザ状態を継続利用する。
 BS_CACHE_DIR = app_dir() / "cache"
 BS_CACHE_FRESH_SEC = 30 * 60
-BS_STATE_PATH = BS_CACHE_DIR / "besoccer_cookies.json"
+BS_PROFILE_DIR = BS_CACHE_DIR / "besoccer_profile"
 _BS_HTML_CACHE = {}
 
 
@@ -2061,20 +2029,6 @@ def besoccer_cache_write(url, html):
         besoccer_cache_path(url).write_text(html, encoding="utf-8")
     except OSError as e:
         debug(f"BeSoccerのキャッシュを書けません: {type(e).__name__}: {e}")
-
-
-def besoccer_load_cookies():
-    """保存済みのクッキーを requests 側にも読み込む(ブラウザ側は storage_state)"""
-    try:
-        state = json.loads(BS_STATE_PATH.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return
-    for cookie in state.get("cookies", []):
-        if "besoccer" in str(cookie.get("domain", "")):
-            BESOCCER_SESSION.cookies.set(cookie.get("name"), cookie.get("value"),
-                                         domain=cookie.get("domain"),
-                                         path=cookie.get("path", "/"))
-    debug(f"BeSoccerのクッキーを{len(BESOCCER_SESSION.cookies)}件読み込みました")
 
 
 def besoccer_fetch(url):
@@ -2105,50 +2059,110 @@ def besoccer_fetch(url):
     return _BS_HTML_CACHE.setdefault(url, (html, None))
 
 
-def besoccer_download(url):
-    """BeSoccerの選手ページを取りに行く。弾かれたら ScrapeError"""
-    besoccer_load_cookies()
-    html = besoccer_get(url)
-    if html is None:
-        log("requestsでは取得できないためブラウザ経由に切り替えます", "WARN")
-        state_path = BS_STATE_PATH
-        try:
-            BS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        except OSError as e:
-            debug(f"cacheフォルダを作れないのでクッキーは保存しません: {e}")
-            state_path = None
-        html = render(url, wait_selector="tr.row-body", locale="en-US",
-                      as_chrome=True, state_path=state_path)
-    if RE_BS_CHALLENGE.search(html[:4000]):
-        raise ScrapeError("BeSoccerのボット確認ページ(CAPTCHA)が返ってきた",
-                          "時間をおいて再実行する。短時間に繰り返し実行しない", url)
-    return html
+async def _render_besoccer(url):
+    """BeSoccer専用: 通常のGoogle ChromeをPersistent Contextで使う。
 
-
-def besoccer_get(url):
-    """requests で取れたらHTMLを返す。弾かれたら None
-
-    HTTP 406 はボット判定の結果なので、繰り返してもまず通らない。
-    無駄に叩くとブロックが強まるため、その場でブラウザ経由へ譲る。
+    固定User-AgentやClient Hintsは設定しない。cache/besoccer_profile を
+    User Data Directoryとして使い、ブラウザ状態を次回へ引き継ぐ。
     """
+    try:
+        BS_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise ScrapeError(
+            "BeSoccer用Chromeプロファイルを作成できません",
+            "cacheフォルダへの書き込み権限を確認",
+            str(BS_PROFILE_DIR),
+        ) from e
+
+    async with async_playwright() as pw:
+        try:
+            ctx = await pw.chromium.launch_persistent_context(
+                user_data_dir=str(BS_PROFILE_DIR),
+                channel="chrome",
+                headless=not CFG["headed"],
+                locale="en-US",
+                timezone_id="Asia/Tokyo",
+                viewport={"width": 1440, "height": 1000},
+            )
+        except Exception as e:
+            # channel=chrome はPCにインストール済みのGoogle Chromeを使用する。
+            if "chrome" in str(e).lower() or "executable" in str(e).lower():
+                raise ScrapeError(
+                    "Google Chromeを起動できません",
+                    "Google Chromeがインストールされているか確認",
+                    str(e),
+                ) from e
+            raise
+
+        page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+        try:
+            resp = await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            status = resp.status if resp else 0
+
+            if status == 404:
+                raise ScrapeError("HTTP 404 ページなし", "BeSoccerの選手URLを確認", url)
+            if status in (403, 406):
+                raise ScrapeError(
+                    f"HTTP {status} BeSoccerのボット確認でブロック",
+                    "時間をおいて再実行する。必要なら --headed で画面を確認",
+                    url,
+                )
+            if status >= 400:
+                raise ScrapeError(f"HTTP {status}", "BeSoccerの選手URLを確認", url)
+
+            # Cookie同意バナーがあれば閉じる。
+            for sel in ("#onetrust-accept-btn-handler",
+                        "button:has-text('I Accept')", "button:has-text('Accept')"):
+                try:
+                    await page.click(sel, timeout=1500)
+                    debug(f"BeSoccer Cookie同意をクリック: {sel}")
+                    break
+                except Exception:
+                    pass
+
+            try:
+                await page.wait_for_selector("tr.row-body", timeout=10000)
+            except Exception:
+                log("BeSoccerの試合行(tr.row-body)が現れませんでした", "WARN")
+
+            html = await page.content()
+            if RE_BS_CHALLENGE.search(html[:10000]):
+                raise ScrapeError(
+                    "BeSoccerのボット確認ページ(CAPTCHA)が返ってきた",
+                    "時間をおいて再実行する。必要なら --headed で画面を確認",
+                    url,
+                )
+            return html
+        finally:
+            # Persistent Contextの状態はuser_data_dirへ自動的に保存される。
+            await ctx.close()
+
+
+def render_besoccer(url):
+    """_render_besoccer を同期的に呼ぶ。"""
+    last = None
     for attempt in range(1, CFG["retry"] + 1):
         try:
-            r = BESOCCER_SESSION.get(url, timeout=CFG["timeout"])
-        except requests.RequestException as e:
-            log(f"BeSoccer取得に失敗({type(e).__name__}: {e})", "WARN")
-        else:
-            if r.status_code == 404:
-                raise ScrapeError("HTTP 404 ページなし", "BeSoccerの選手URLを確認", url)
-            if r.status_code == 200 and len(r.text) >= 2000:
-                r.encoding = r.apparent_encoding
-                time.sleep(CFG["sleep"])
-                return r.text
-            log(f"BeSoccerがHTTP {r.status_code}を返しました(ボット判定)", "WARN")
-            if r.status_code == 406:
-                return None
-        if attempt < CFG["retry"]:
-            time.sleep(CFG["sleep"] * 2)
-    return None
+            return asyncio.run(_render_besoccer(url))
+        except ScrapeError:
+            # HTTP 403/406やCAPTCHAは連続リトライしない。
+            raise
+        except Exception as e:
+            last = e
+            if attempt < CFG["retry"]:
+                log(f"BeSoccerブラウザ取得に失敗({type(e).__name__}) → "
+                    f"{attempt}回目リトライ", "WARN")
+                time.sleep(CFG["sleep"] * 2)
+    raise ScrapeError(
+        f"BeSoccerブラウザ取得に失敗: {type(last).__name__}: {last}",
+        "Google ChromeとPlaywrightの実行環境を確認",
+        url,
+    )
+
+
+def besoccer_download(url):
+    """BeSoccerはrequestsを経由せず、最初から実Chromeで取得する。"""
+    return render_besoccer(url)
 
 
 def besoccer_match_table(soup):
