@@ -16,6 +16,8 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import messagebox, ttk
 
+from version import APP_VERSION
+
 
 def app_dir():
     if getattr(sys, "frozen", False):
@@ -49,7 +51,7 @@ def default_output_name():
 class LoanWatchGui(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("LoanWatch")
+        self.title(f"LoanWatch {APP_VERSION}")
         self.geometry("900x640")
         self.minsize(760, 520)
 

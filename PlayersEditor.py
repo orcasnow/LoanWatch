@@ -19,6 +19,8 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 from urllib.parse import quote, urljoin
 
+from version import APP_VERSION
+
 
 def configure_system_cert_store():
     if getattr(sys, "frozen", False):
@@ -522,7 +524,7 @@ class PlayersEditor(tk.Tk):
         self.search_generation = 0
         self.loading_form = False
 
-        self.title(f"players.json editor - {self.config_path.name}")
+        self.title(f"選手設定の編集 - {self.config_path.name} (LoanWatch {APP_VERSION})")
         self.geometry("1180x760")
         self.minsize(960, 640)
         self.protocol("WM_DELETE_WINDOW", self.on_close)

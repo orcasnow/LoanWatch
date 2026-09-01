@@ -42,11 +42,15 @@ import time
 import traceback
 import hashlib
 import json
+import platform
 import unicodedata
+from importlib import metadata as importlib_metadata
 from datetime import date, datetime
 from io import StringIO
 from pathlib import Path
 from urllib.parse import urljoin, urlparse, parse_qs
+
+from version import APP_VERSION
 
 
 def configure_system_cert_store():
@@ -1993,16 +1997,31 @@ BS_MONTHS = {m: i for i, m in enumerate(
 # User-Agent / Client Hintsは固定値で上書きせず、実Chrome自身の値を使用する。
 # 短時間に何度も叩くとCAPTCHA(Client Challenge)に飛ばされることがあるため、
 # 1回の実行で選手ページは1度しか取りに行かない。
-RE_BS_CHALLENGE = re.compile(r"Client Challenge|_Incapsula_Resource|captcha", re.I)
+RE_BS_CHALLENGE = re.compile(r"Client Challenge|_Incapsula_Resource|captcha|incapsula|imperva", re.I)
 
 # 取得したHTMLとBeSoccer専用Chromeプロファイルは cache/ に残す。
 # * HTML … ブロックされた回に前回分で行を出せるようにする(備考へ取得日時を入れる)。
 #           取り立てなら取りに行かないので、続けて実行してもアクセスは増えない。
 # * profile … Cookie / Local Storage等を含むブラウザ状態を継続利用する。
+# * diagnostics … --debug時に403/406/CAPTCHA等の原因調査材料を保存する。
+#   Cookie/Authorization/Storageの「値」は保存せず、Cookie名・Storageキー名だけ残す。
 BS_CACHE_DIR = app_dir() / "cache"
 BS_CACHE_FRESH_SEC = 30 * 60
+# 実Chrome用の既存プロファイルは互換性維持のため従来名を継続使用する。
+# フォールバックするPlaywright Chromiumはブラウザ世代差によるプロファイル破損を避けるため別ディレクトリにする。
 BS_PROFILE_DIR = BS_CACHE_DIR / "besoccer_profile"
+BS_CHROMIUM_PROFILE_DIR = BS_CACHE_DIR / "besoccer_profile_chromium"
+BS_DIAG_DIR = BS_CACHE_DIR / "besoccer_diagnostics"
 _BS_HTML_CACHE = {}
+
+# ログへ値を残さないヘッダー。Set-Cookie/Cookieは名前だけを抽出する。
+BS_SECRET_HEADER_NAMES = {
+    "authorization", "proxy-authorization", "x-api-key", "x-auth-token",
+    "x-csrf-token", "x-xsrf-token",
+}
+BS_SECRET_QUERY_RE = re.compile(
+    r"(?:token|auth|key|secret|session|sid|captcha|challenge|signature|sig|hash|nonce)", re.I
+)
 
 
 def besoccer_cache_path(url):
@@ -2059,56 +2078,647 @@ def besoccer_fetch(url):
     return _BS_HTML_CACHE.setdefault(url, (html, None))
 
 
-async def _render_besoccer(url):
-    """BeSoccer専用: 通常のGoogle ChromeをPersistent Contextで使う。
+def _bs_json_default(value):
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, Path):
+        return str(value)
+    return str(value)
 
-    固定User-AgentやClient Hintsは設定しない。cache/besoccer_profile を
-    User Data Directoryとして使い、ブラウザ状態を次回へ引き継ぐ。
+
+def _bs_write_json(path, value):
+    try:
+        path.write_text(json.dumps(value, ensure_ascii=False, indent=2,
+                                   default=_bs_json_default), encoding="utf-8")
+    except Exception as e:
+        debug(f"BeSoccer診断JSONを書けません({path.name}): {type(e).__name__}: {e}")
+
+
+def _bs_write_text(path, value):
+    try:
+        path.write_text(str(value), encoding="utf-8", errors="replace")
+    except Exception as e:
+        debug(f"BeSoccer診断テキストを書けません({path.name}): {type(e).__name__}: {e}")
+
+
+def _bs_cookie_names_from_cookie_header(value):
+    """Cookie: a=1; b=2 から値を捨ててCookie名だけ返す。"""
+    names = []
+    for part in str(value or "").split(";"):
+        name = part.split("=", 1)[0].strip()
+        if name and name.lower() not in {"path", "domain", "expires", "max-age",
+                                        "secure", "httponly", "samesite"}:
+            names.append(name)
+    return sorted(set(names))
+
+
+def _bs_set_cookie_name(value):
+    """Set-Cookie 1行からCookie名だけ返す。"""
+    first = str(value or "").split(";", 1)[0]
+    return first.split("=", 1)[0].strip() if "=" in first else ""
+
+
+def _bs_sanitize_header_array(headers):
+    """Playwright headers_array() の値から認証情報を除去する。"""
+    out = []
+    for h in headers or []:
+        name = str(h.get("name", ""))
+        value = str(h.get("value", ""))
+        lower = name.lower()
+        if lower == "cookie":
+            value = f"<redacted; cookie_names={_bs_cookie_names_from_cookie_header(value)}>"
+        elif lower == "set-cookie":
+            cookie_name = _bs_set_cookie_name(value)
+            value = f"<redacted; cookie_name={cookie_name or 'unknown'}>"
+        elif lower in BS_SECRET_HEADER_NAMES or "password" in lower or "secret" in lower:
+            value = "<redacted>"
+        out.append({"name": name, "value": value})
+    return out
+
+
+def _bs_safe_url(url):
+    """診断ログ用URL。疑わしいquery値だけ伏せ、パラメータ名は残す。"""
+    try:
+        from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+        parts = urlsplit(str(url))
+        query = []
+        for key, value in parse_qsl(parts.query, keep_blank_values=True):
+            query.append((key, "<redacted>" if BS_SECRET_QUERY_RE.search(key) else value))
+        return urlunsplit((parts.scheme, parts.netloc, parts.path,
+                           urlencode(query, doseq=True), parts.fragment))
+    except Exception:
+        return str(url)
+
+
+def _bs_profile_summary(profile_dir=None):
+    """プロファイルの中身は読まず、存在・ファイル数・更新日時だけ診断材料にする。"""
+    profile_dir = Path(profile_dir or BS_PROFILE_DIR)
+    info = {"path": str(profile_dir), "exists": profile_dir.exists()}
+    if not profile_dir.exists():
+        return info
+    try:
+        files = [x for x in profile_dir.rglob("*") if x.is_file()]
+        info["file_count"] = len(files)
+        info["total_bytes"] = sum(x.stat().st_size for x in files)
+        mtimes = [x.stat().st_mtime for x in files]
+        if mtimes:
+            info["newest_file_mtime"] = datetime.fromtimestamp(max(mtimes)).isoformat()
+        # ファイル名だけ。Cookie DB等の内容は読み出さない。
+        info["top_level_entries"] = sorted(x.name for x in profile_dir.iterdir())[:100]
+    except Exception as e:
+        info["error"] = f"{type(e).__name__}: {e}"
+    return info
+
+
+def _bs_chrome_unavailable(exc):
+    """Google Chromeが未インストール/実行ファイル不在と判断できるPlaywright例外か。
+
+    プロファイルロックや起動直後クラッシュなど、Chromeが「存在するのに起動できない」
+    障害までChromiumへ隠れてフォールバックしないよう、明確な不在メッセージだけを対象にする。
+    """
+    text = str(exc).lower()
+    needles = (
+        "distribution 'chrome' is not found",
+        'distribution "chrome" is not found',
+        "chrome distribution is not found",
+        "google chrome is not installed",
+        "chrome is not installed",
+        "could not find chrome",
+        "chrome executable not found",
+        "chrome not found",
+        "executable doesn't exist",
+        "executable does not exist",
+        "enoent",
+    )
+    return any(n in text for n in needles)
+
+
+async def _bs_browser_environment(page):
+    """ブラウザ自身がJSへ公開している環境情報を取得する。偽装は行わない。"""
+    script = r"""
+    async () => {
+      const result = {
+        userAgent: navigator.userAgent,
+        appVersion: navigator.appVersion,
+        platform: navigator.platform,
+        vendor: navigator.vendor,
+        webdriver: navigator.webdriver,
+        language: navigator.language,
+        languages: Array.from(navigator.languages || []),
+        cookieEnabled: navigator.cookieEnabled,
+        doNotTrack: navigator.doNotTrack,
+        hardwareConcurrency: navigator.hardwareConcurrency,
+        deviceMemory: navigator.deviceMemory,
+        maxTouchPoints: navigator.maxTouchPoints,
+        pdfViewerEnabled: navigator.pdfViewerEnabled,
+        onLine: navigator.onLine,
+        windowChromePresent: !!window.chrome,
+        screen: {
+          width: screen.width, height: screen.height,
+          availWidth: screen.availWidth, availHeight: screen.availHeight,
+          colorDepth: screen.colorDepth, pixelDepth: screen.pixelDepth,
+          devicePixelRatio: window.devicePixelRatio,
+          innerWidth: window.innerWidth, innerHeight: window.innerHeight,
+          outerWidth: window.outerWidth, outerHeight: window.outerHeight
+        },
+        timezone: Intl.DateTimeFormat().resolvedOptions(),
+        plugins: Array.from(navigator.plugins || []).map(p => ({name:p.name, filename:p.filename})),
+        mimeTypes: Array.from(navigator.mimeTypes || []).map(m => m.type),
+      };
+      if (navigator.userAgentData) {
+        result.userAgentData = {
+          brands: navigator.userAgentData.brands,
+          mobile: navigator.userAgentData.mobile,
+          platform: navigator.userAgentData.platform,
+        };
+        if (navigator.userAgentData.getHighEntropyValues) {
+          try {
+            result.userAgentData.highEntropy = await navigator.userAgentData.getHighEntropyValues([
+              'architecture','bitness','formFactors','fullVersionList','model',
+              'platformVersion','uaFullVersion','wow64'
+            ]);
+          } catch (e) {
+            result.userAgentData.highEntropyError = String(e);
+          }
+        }
+      }
+      try {
+        result.storage = {
+          localStorageKeys: Object.keys(localStorage),
+          sessionStorageKeys: Object.keys(sessionStorage)
+        };
+      } catch (e) {
+        result.storage = {error:String(e)};
+      }
+      try {
+        result.indexedDB = indexedDB.databases
+          ? (await indexedDB.databases()).map(db => ({name:db.name, version:db.version}))
+          : {supported:false};
+      } catch (e) {
+        result.indexedDB = {error:String(e)};
+      }
+      try {
+        result.serviceWorkers = navigator.serviceWorker
+          ? (await navigator.serviceWorker.getRegistrations()).map(r => ({
+              scope:r.scope,
+              active:r.active ? r.active.scriptURL : null,
+              waiting:r.waiting ? r.waiting.scriptURL : null,
+              installing:r.installing ? r.installing.scriptURL : null
+            }))
+          : [];
+      } catch (e) {
+        result.serviceWorkers = {error:String(e)};
+      }
+      return result;
+    }
     """
     try:
-        BS_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+        return await page.evaluate(script)
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+async def _bs_cookie_metadata(ctx, url):
+    """Cookie値は絶対に保存せず、WAF系Cookieの存在を確認できるメタ情報だけ返す。"""
+    try:
+        cookies = await ctx.cookies([url])
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+    out = []
+    for c in cookies:
+        out.append({
+            "name": c.get("name"),
+            "domain": c.get("domain"),
+            "path": c.get("path"),
+            "expires": c.get("expires"),
+            "httpOnly": c.get("httpOnly"),
+            "secure": c.get("secure"),
+            "sameSite": c.get("sameSite"),
+            "value": "<redacted>",
+        })
+    return out
+
+
+async def _bs_save_diagnostics(page, ctx, requested_url, response, reason,
+                               network_events, failed_requests, console_events,
+                               page_errors, profile_before, browser_channel="chrome",
+                               browser_source="installed_google_chrome", profile_dir=None,
+                               fallback_reason=""):
+    """403/406/CAPTCHA等の診断材料をcache/besoccer_diagnosticsへ保存する。
+
+    CAPTCHA突破のための値は収集せず、Cookie/Authorization/Storage値は伏せる。
+    戻り値は作成した診断ディレクトリ(Path)。
+    """
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+    status = response.status if response else 0
+    digest = hashlib.sha1(requested_url.encode("utf-8")).hexdigest()[:8]
+    safe_reason = re.sub(r"[^A-Za-z0-9_-]+", "_", str(reason))[:40].strip("_") or "diagnostic"
+    diag_dir = BS_DIAG_DIR / f"{timestamp}_{status}_{safe_reason}_{digest}"
+    try:
+        diag_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        debug(f"BeSoccer診断フォルダを作成できません: {type(e).__name__}: {e}")
+        return None
+
+    # JSチャレンジによるDOM更新や遷移直後の状態も拾うため短く待つ。
+    try:
+        await page.wait_for_timeout(800)
+    except Exception:
+        pass
+
+    try:
+        final_url = page.url
+    except Exception:
+        final_url = ""
+    try:
+        title = await page.title()
+    except Exception as e:
+        title = f"<title取得失敗: {type(e).__name__}: {e}>"
+
+    request_headers = []
+    response_headers = []
+    security_details = None
+    server_addr = None
+    status_text = ""
+    if response:
+        try:
+            request_headers = _bs_sanitize_header_array(await response.request.headers_array())
+        except Exception as e:
+            request_headers = [{"error": f"{type(e).__name__}: {e}"}]
+        try:
+            response_headers = _bs_sanitize_header_array(await response.headers_array())
+        except Exception as e:
+            response_headers = [{"error": f"{type(e).__name__}: {e}"}]
+        try:
+            security_details = await response.security_details()
+        except Exception as e:
+            security_details = {"error": f"{type(e).__name__}: {e}"}
+        try:
+            server_addr = await response.server_addr()
+        except Exception as e:
+            server_addr = {"error": f"{type(e).__name__}: {e}"}
+        try:
+            status_text = response.status_text
+        except Exception:
+            pass
+
+    # レスポンスのraw body。challenge token等が含まれる可能性はあるため、
+    # 外部送信はせずローカル診断フォルダだけに保存する。
+    body_info = {"saved": False}
+    if response:
+        try:
+            body = await response.body()
+            (diag_dir / "response_body.bin").write_bytes(body)
+            body_info = {"saved": True, "bytes": len(body), "sha256": hashlib.sha256(body).hexdigest()}
+            # HTML/textとして読める場合の確認用コピー。
+            try:
+                decoded = body.decode("utf-8", errors="replace")
+                _bs_write_text(diag_dir / "response_body.html", decoded)
+            except Exception:
+                pass
+        except Exception as e:
+            body_info = {"saved": False, "error": f"{type(e).__name__}: {e}"}
+
+    try:
+        dom = await page.content()
+        _bs_write_text(diag_dir / "dom.html", dom)
+        dom_info = {"chars": len(dom), "sha256": hashlib.sha256(dom.encode("utf-8", errors="replace")).hexdigest()}
+    except Exception as e:
+        dom_info = {"error": f"{type(e).__name__}: {e}"}
+
+    screenshot_info = {"saved": False}
+    try:
+        screenshot_path = diag_dir / "screenshot.png"
+        await page.screenshot(path=str(screenshot_path), full_page=True)
+        screenshot_info = {"saved": True, "path": screenshot_path.name}
+    except Exception as e:
+        screenshot_info = {"saved": False, "error": f"{type(e).__name__}: {e}"}
+
+    browser_environment = await _bs_browser_environment(page)
+    cookie_metadata = await _bs_cookie_metadata(ctx, final_url or requested_url)
+
+    try:
+        playwright_version = importlib_metadata.version("playwright")
+    except Exception:
+        playwright_version = "unknown"
+
+    summary = {
+        "captured_at_local": datetime.now().astimezone().isoformat(),
+        "reason": reason,
+        "navigation_status": status,
+        "navigation_status_text": status_text,
+        "requested_url": _bs_safe_url(requested_url),
+        "final_url": _bs_safe_url(final_url),
+        "title": title,
+        "headless": not CFG.get("headed", False),
+        "channel": browser_channel,
+        "browser_source": browser_source,
+        "profile_dir": str(profile_dir or BS_PROFILE_DIR),
+        "fallback_reason": fallback_reason,
+        "locale": "en-US",
+        "timezone_id": "Asia/Tokyo",
+        "viewport": {"width": 1440, "height": 1000},
+        "python": {
+            "version": sys.version,
+            "executable": sys.executable,
+            "implementation": platform.python_implementation(),
+        },
+        "os": {
+            "platform": platform.platform(),
+            "system": platform.system(),
+            "release": platform.release(),
+            "version": platform.version(),
+            "machine": platform.machine(),
+        },
+        "app_version": globals().get("APP_VERSION", "unknown"),
+        "playwright_version": playwright_version,
+        "profile_before_launch": profile_before,
+        "profile_after_capture": _bs_profile_summary(profile_dir),
+        "response_body": body_info,
+        "dom": dom_info,
+        "screenshot": screenshot_info,
+        "security_details": security_details,
+        "server_addr": server_addr,
+        "network_event_count": len(network_events),
+        "failed_request_count": len(failed_requests),
+        "console_event_count": len(console_events),
+        "page_error_count": len(page_errors),
+        "privacy_note": (
+            "Cookie/Authorization/Storageの値は保存していません。"
+            "response_bodyにはサイトが返したchallenge用の一時値が含まれる可能性があります。"
+        ),
+    }
+
+    _bs_write_json(diag_dir / "summary.json", summary)
+    _bs_write_json(diag_dir / "request_headers.json", request_headers)
+    _bs_write_json(diag_dir / "response_headers.json", response_headers)
+    _bs_write_json(diag_dir / "browser_environment.json", browser_environment)
+    _bs_write_json(diag_dir / "cookies_metadata.json", cookie_metadata)
+    _bs_write_json(diag_dir / "network.json", network_events)
+    _bs_write_json(diag_dir / "request_failures.json", failed_requests)
+    _bs_write_json(diag_dir / "console.json", console_events)
+    _bs_write_json(diag_dir / "page_errors.json", page_errors)
+
+    # 人が最初に見るための簡易テキスト。
+    ua = browser_environment.get("userAgent", "") if isinstance(browser_environment, dict) else ""
+    webdriver = browser_environment.get("webdriver", "") if isinstance(browser_environment, dict) else ""
+    ua_data = browser_environment.get("userAgentData", {}) if isinstance(browser_environment, dict) else {}
+    hint_lines = [
+        f"captured_at: {summary['captured_at_local']}",
+        f"reason: {reason}",
+        f"status: {status} {status_text}",
+        f"requested_url: {_bs_safe_url(requested_url)}",
+        f"final_url: {_bs_safe_url(final_url)}",
+        f"title: {title}",
+        f"headless: {summary['headless']}",
+        f"browser_channel: {browser_channel}",
+        f"browser_source: {browser_source}",
+        f"profile_dir: {profile_dir or BS_PROFILE_DIR}",
+        f"fallback_reason: {fallback_reason or '(none)'}",
+        f"Playwright: {playwright_version}",
+        f"navigator.userAgent: {ua}",
+        f"navigator.webdriver: {webdriver}",
+        f"navigator.userAgentData: {json.dumps(ua_data, ensure_ascii=False, default=_bs_json_default)}",
+        f"server_addr: {json.dumps(server_addr, ensure_ascii=False, default=_bs_json_default)}",
+        f"security_details: {json.dumps(security_details, ensure_ascii=False, default=_bs_json_default)}",
+        f"network_events: {len(network_events)}",
+        f"request_failures: {len(failed_requests)}",
+        "",
+        "詳細は summary.json / request_headers.json / response_headers.json /",
+        "browser_environment.json / cookies_metadata.json / network.json / screenshot.png /",
+        "response_body.html / dom.html を確認してください。",
+        "Cookie/Authorization/Storageの値は意図的に保存していません。",
+    ]
+    _bs_write_text(diag_dir / "README.txt", "\n".join(hint_lines))
+    log(f"BeSoccer診断情報を保存しました: {diag_dir}", "WARN")
+    return diag_dir
+
+
+async def _render_besoccer(url):
+    """BeSoccer専用ブラウザ取得。
+
+    1. まずPCにインストール済みのGoogle Chrome(channel="chrome")を使う。
+    2. Chromeが明確に未インストール/実行ファイル不在の場合だけ、Playwright同梱の
+       Chromium(channel="chromium")へフォールバックする。
+    3. UA / Client Hintsはどちらも固定値で上書きせず、実ブラウザ自身の値を使う。
+    4. Chrome/ChromiumでUser Data Directoryを分離し、プロファイル互換性問題を避ける。
+    5. --debug時は成功/失敗とも実際に使用したchannel/sourceを診断情報へ保存する。
+    """
+    chrome_profile = BS_PROFILE_DIR
+    chromium_profile = BS_CHROMIUM_PROFILE_DIR
+
+    try:
+        chrome_profile.mkdir(parents=True, exist_ok=True)
     except OSError as e:
         raise ScrapeError(
             "BeSoccer用Chromeプロファイルを作成できません",
             "cacheフォルダへの書き込み権限を確認",
-            str(BS_PROFILE_DIR),
+            str(chrome_profile),
         ) from e
 
     async with async_playwright() as pw:
+        browser_channel = "chrome"
+        browser_source = "installed_google_chrome"
+        profile_dir = chrome_profile
+        fallback_reason = ""
+        profile_before = _bs_profile_summary(profile_dir)
+
         try:
             ctx = await pw.chromium.launch_persistent_context(
-                user_data_dir=str(BS_PROFILE_DIR),
+                user_data_dir=str(profile_dir),
                 channel="chrome",
                 headless=not CFG["headed"],
                 locale="en-US",
                 timezone_id="Asia/Tokyo",
                 viewport={"width": 1440, "height": 1000},
             )
-        except Exception as e:
-            # channel=chrome はPCにインストール済みのGoogle Chromeを使用する。
-            if "chrome" in str(e).lower() or "executable" in str(e).lower():
+            debug("BeSoccerブラウザ: インストール済みGoogle Chrome (channel=chrome)")
+        except Exception as chrome_error:
+            if not _bs_chrome_unavailable(chrome_error):
+                # Chromeは存在している可能性が高い。プロファイルロックやポリシー等を
+                # Chromiumフォールバックで隠さず、そのまま原因を通知する。
                 raise ScrapeError(
                     "Google Chromeを起動できません",
-                    "Google Chromeがインストールされているか確認",
-                    str(e),
+                    "Chromeのプロファイルロック、企業ポリシー、実行権限を確認",
+                    str(chrome_error),
+                ) from chrome_error
+
+            fallback_reason = f"{type(chrome_error).__name__}: {chrome_error}"
+            log("Google Chromeが見つからないため、Playwright Chromiumへ切り替えます", "WARN")
+            debug(f"Chrome起動失敗詳細: {fallback_reason}")
+
+            browser_channel = "chromium"
+            browser_source = "playwright_bundled_chromium"
+            profile_dir = chromium_profile
+            try:
+                profile_dir.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                raise ScrapeError(
+                    "BeSoccer用Chromiumプロファイルを作成できません",
+                    "cacheフォルダへの書き込み権限を確認",
+                    str(profile_dir),
                 ) from e
-            raise
+            profile_before = _bs_profile_summary(profile_dir)
+
+            try:
+                ctx = await pw.chromium.launch_persistent_context(
+                    user_data_dir=str(profile_dir),
+                    channel="chromium",
+                    headless=not CFG["headed"],
+                    locale="en-US",
+                    timezone_id="Asia/Tokyo",
+                    viewport={"width": 1440, "height": 1000},
+                )
+                log("BeSoccerブラウザ: Playwright Chromium (channel=chromium)", "WARN")
+            except Exception as chromium_error:
+                command = f'"{sys.executable}" -m playwright install chromium'
+                raise ScrapeError(
+                    "Google ChromeもPlaywright Chromiumも起動できません",
+                    f"Chromeをインストールするか、同梱/インストール済みChromiumを確認。開発環境では {command}",
+                    f"Chrome: {chrome_error}\nChromium: {chromium_error}",
+                ) from chromium_error
 
         page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+
+        # ナビゲーションの実HTTPステータスを控えておく。本文が空のエラー応答
+        # (BeSoccerの406など)は、Chromeがレスポンスではなくナビゲーション失敗
+        # として扱うため page.goto から resp を受け取れない。そのときに
+        # 403/406 の正規経路へ戻すための材料になる。--debug の有無に関わらず必要。
+        nav_status = {"code": None}
+
+        def on_navigation_response(res):
+            try:
+                if res.request.is_navigation_request():
+                    nav_status["code"] = res.status
+            except Exception:
+                pass
+
+        page.on("response", on_navigation_response)
+
+        # --debug時だけネットワーク/Consoleを収集する。Cookie値等はイベントには保存しない。
+        network_events = []
+        failed_requests = []
+        console_events = []
+        page_errors = []
+        if CFG.get("debug"):
+            def on_request(req):
+                try:
+                    network_events.append({
+                        "event": "request",
+                        "time": datetime.now().astimezone().isoformat(),
+                        "method": req.method,
+                        "resource_type": req.resource_type,
+                        "navigation": req.is_navigation_request(),
+                        "url": _bs_safe_url(req.url),
+                    })
+                except Exception:
+                    pass
+
+            def on_response(res):
+                try:
+                    network_events.append({
+                        "event": "response",
+                        "time": datetime.now().astimezone().isoformat(),
+                        "status": res.status,
+                        "status_text": res.status_text,
+                        "resource_type": res.request.resource_type,
+                        "url": _bs_safe_url(res.url),
+                    })
+                except Exception:
+                    pass
+
+            def on_request_failed(req):
+                try:
+                    failed_requests.append({
+                        "time": datetime.now().astimezone().isoformat(),
+                        "method": req.method,
+                        "resource_type": req.resource_type,
+                        "url": _bs_safe_url(req.url),
+                        "failure": req.failure,
+                    })
+                except Exception:
+                    pass
+
+            def on_console(msg):
+                try:
+                    console_events.append({
+                        "time": datetime.now().astimezone().isoformat(),
+                        "type": msg.type,
+                        "text": msg.text,
+                    })
+                except Exception:
+                    pass
+
+            def on_page_error(exc):
+                try:
+                    page_errors.append({
+                        "time": datetime.now().astimezone().isoformat(),
+                        "error": str(exc),
+                    })
+                except Exception:
+                    pass
+
+            page.on("request", on_request)
+            page.on("response", on_response)
+            page.on("requestfailed", on_request_failed)
+            page.on("console", on_console)
+            page.on("pageerror", on_page_error)
+
+        async def save_diag(response, reason):
+            if not CFG.get("debug"):
+                return None
+            return await _bs_save_diagnostics(
+                page, ctx, url, response, reason,
+                network_events, failed_requests, console_events,
+                page_errors, profile_before,
+                browser_channel=browser_channel,
+                browser_source=browser_source,
+                profile_dir=profile_dir,
+                fallback_reason=fallback_reason,
+            )
+
         try:
-            resp = await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            status = resp.status if resp else 0
+            try:
+                resp = await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                status = resp.status if resp else 0
+            except Exception as goto_error:
+                # ERR_HTTP_RESPONSE_CODE_FAILURE は406専用ではなく404などでも起きる。
+                # 決め打ちせず、responseイベントで控えた実ステータスで判定する。
+                if "ERR_HTTP_RESPONSE_CODE_FAILURE" not in str(goto_error):
+                    raise
+                resp, status = None, nav_status["code"]
+                debug(f"page.goto がHTTPエラー応答で失敗。"
+                      f"responseイベントのステータス={status}")
+                if status is None:
+                    # ステータスを取れなかった。原因は確定できないが、HTTPエラー応答が
+                    # 返っている以上すぐ叩き直しても通らない。リトライせず終える。
+                    diag_dir = await save_diag(None, "http_response_code_failure")
+                    hint = "BeSoccerがHTTPエラー応答を返した可能性。時間をおいて再実行する"
+                    if diag_dir:
+                        hint += f"。診断情報: {diag_dir}"
+                    raise ScrapeError(
+                        "BeSoccerからHTTPエラー応答(ステータス不明)", hint, url,
+                    ) from goto_error
 
             if status == 404:
+                await save_diag(resp, "http_404")
                 raise ScrapeError("HTTP 404 ページなし", "BeSoccerの選手URLを確認", url)
             if status in (403, 406):
+                diag_dir = await save_diag(resp, f"http_{status}")
+                hint = "時間をおいて再実行する。必要なら --headed で画面を確認"
+                if diag_dir:
+                    hint += f"。診断情報: {diag_dir}"
                 raise ScrapeError(
                     f"HTTP {status} BeSoccerのボット確認でブロック",
-                    "時間をおいて再実行する。必要なら --headed で画面を確認",
+                    hint,
                     url,
                 )
             if status >= 400:
-                raise ScrapeError(f"HTTP {status}", "BeSoccerの選手URLを確認", url)
+                diag_dir = await save_diag(resp, f"http_{status}")
+                hint = "BeSoccerの選手URLを確認"
+                if diag_dir:
+                    hint += f"。診断情報: {diag_dir}"
+                raise ScrapeError(f"HTTP {status}", hint, url)
 
             # Cookie同意バナーがあれば閉じる。
             for sel in ("#onetrust-accept-btn-handler",
@@ -2126,17 +2736,33 @@ async def _render_besoccer(url):
                 log("BeSoccerの試合行(tr.row-body)が現れませんでした", "WARN")
 
             html = await page.content()
-            if RE_BS_CHALLENGE.search(html[:10000]):
+            if RE_BS_CHALLENGE.search(html[:20000]):
+                diag_dir = await save_diag(resp, "challenge_in_dom")
+                hint = "時間をおいて再実行する。必要なら --headed で画面を確認"
+                if diag_dir:
+                    hint += f"。診断情報: {diag_dir}"
                 raise ScrapeError(
                     "BeSoccerのボット確認ページ(CAPTCHA)が返ってきた",
-                    "時間をおいて再実行する。必要なら --headed で画面を確認",
+                    hint,
                     url,
                 )
-            return html
-        finally:
-            # Persistent Contextの状態はuser_data_dirへ自動的に保存される。
-            await ctx.close()
 
+            await save_diag(resp, "success")
+            return html
+        except ScrapeError:
+            raise
+        except Exception as e:
+            diag_dir = None
+            try:
+                diag_dir = await save_diag(None, f"exception_{type(e).__name__}")
+            except Exception:
+                pass
+            if diag_dir:
+                debug(f"BeSoccer例外時の診断情報: {diag_dir}")
+            raise
+        finally:
+            # Persistent Contextの状態は選択したuser_data_dirへ自動的に保存される。
+            await ctx.close()
 
 def render_besoccer(url):
     """_render_besoccer を同期的に呼ぶ。"""
@@ -2153,10 +2779,13 @@ def render_besoccer(url):
                 log(f"BeSoccerブラウザ取得に失敗({type(e).__name__}) → "
                     f"{attempt}回目リトライ", "WARN")
                 time.sleep(CFG["sleep"] * 2)
+    # Playwrightの例外は Call log が続く複数行になる。Excelの備考へそのまま
+    # 入ると列が読めなくなるので、1行目だけを出し、全文は detail(画面表示)へ回す。
+    head = str(last).splitlines()[0].strip() if last else ""
     raise ScrapeError(
-        f"BeSoccerブラウザ取得に失敗: {type(last).__name__}: {last}",
+        f"BeSoccerブラウザ取得に失敗: {type(last).__name__}: {head}",
         "Google ChromeとPlaywrightの実行環境を確認",
-        url,
+        f"{url}\n{last}",
     )
 
 
@@ -2350,12 +2979,22 @@ def besoccer_row(player, team_conf, match, fetched_at=None):
     return row
 
 
+def bs_short_note(note, limit=120):
+    """Excelの備考へ入れる文言を1行に丸める
+
+    Playwrightの例外などは複数行になり、そのまま入れると列が読めなくなる。
+    全文は画面のログと cache/besoccer_diagnostics/ に残るので、ここは短くてよい。
+    """
+    one_line = " ".join(str(note).split())
+    return one_line if len(one_line) <= limit else one_line[:limit - 1] + "…"
+
+
 def besoccer_blank_row(player, team_conf, note):
     """試合を取れなかったチームの行を 試合なし で作る
 
     黙って行を消すと、設定漏れなのか取得失敗なのか画面から分からなくなる。
     """
-    row = blank(player, NO_MATCH, f"{BESOCCER} / {note}")
+    row = blank(player, NO_MATCH, f"{BESOCCER} / {bs_short_note(note)}")
     row["クラブ"] = str(team_conf.get("club", "")).strip() or player["club"]
     row["リーグ名"] = str(team_conf.get("league", "")).strip()
     return row
@@ -2521,7 +3160,9 @@ def format_excel(path, team_latest_urls=None):
 # メイン
 # =========================================================
 def build_parser():
-    ap = argparse.ArgumentParser(description="レンタル移籍選手の最新試合 出場ステータス一覧")
+    ap = argparse.ArgumentParser(
+        description=f"レンタル移籍選手の最新試合 出場ステータス一覧 (LoanWatch {APP_VERSION})")
+    ap.add_argument("--version", action="version", version=f"LoanWatch {APP_VERSION}")
     ap.add_argument("--year", type=int, default=2026, help="対象シーズン(既定: 2026)")
     ap.add_argument("--sleep", type=float, default=2.0, help="アクセス間隔(秒)")
     ap.add_argument("--timeout", type=int, default=30, help="HTTPタイムアウト(秒)")
@@ -2634,7 +3275,7 @@ def main():
 
     df = pd.DataFrame(rows, columns=COLUMNS)
     print("\n" + "=" * 78)
-    print(f" 最新試合の出場状況  (集計日: {date.today():%Y-%m-%d})")
+    print(f" 最新試合の出場状況  (集計日: {date.today():%Y-%m-%d} / LoanWatch {APP_VERSION})")
     print("=" * 78)
     print(df.drop(columns=["URL"]).to_string(index=False))
 
