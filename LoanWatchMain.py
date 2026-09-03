@@ -121,6 +121,11 @@ HEADERS = {
 # 選手マスタは players.json で管理する。
 # source: "espn" | "transfermarkt" | "football-lab" | "besoccer" | "manual"
 # espn_id は ESPN 選手URLの /id/<数字>/、jleague_url は出場時間補完用。
+# u21_club_id は、所属クラブが U-21 Ｊリーグに参加している選手だけに書く。
+# 日程ページ https://www.jleague.jp/u-21/match/ でクラブを絞ったときの
+# URL に付く &club=<ここ> の数字(例: ファジアーノ岡山 = 33189)。
+# 書いておくと試合ページのメンバー表まで見に行くので、出場しなかった試合も
+# ベンチ入りのみ/ベンチ外として判別できる。未記入なら出場履歴だけを見る。
 # espn_team_id を書いておくと、チームの結果ページ
 #   (https://www.espn.com/soccer/team/results/_/id/<espn_team_id>)
 # と突き合わせ、選手ページの Last 5 Matches がチームの最新試合より
@@ -160,8 +165,17 @@ def load_players(config_path):
         missing = sorted(required - set(player))
         if missing:
             raise ValueError(f"選手設定の {i} 件目に必須項目がありません: {', '.join(missing)}")
+        validate_u21_club_id(player, i)
         validate_besoccer(player, i)
     return players
+
+
+def validate_u21_club_id(player, i):
+    """任意項目 u21_club_id が数字かどうかを確かめる"""
+    value = str(player.get("u21_club_id", "")).strip()
+    if value and not value.isdigit():
+        raise ValueError(f"選手設定の {i} 件目の u21_club_id は数字で書いてください "
+                         f"(U-21日程ページの &club= の値): {value!r}")
 
 
 def validate_besoccer(player, i):
@@ -1250,26 +1264,47 @@ def with_other_competitions(rows, player, season_start):
     return with_emperor_row(rows, player, season_start)
 
 
+def with_cup_row(rows, player, season_start, build_row, label, fallback=None):
+    """カップ戦(メンバー表を読む大会)の行を足して返す
+
+    メンバー表を読むのでベンチ外も判別できる。取得に失敗した場合、
+    fallback(出場履歴からの組み立て)があればそちらへ落とす。
+    """
+    try:
+        cup = build_row(player, season_start)
+    except ScrapeError as e:
+        log(f"{label}の確認に失敗: {e.summary()}", "WARN")
+        cup = None
+        if fallback is None:
+            return rows
+    if cup is None and fallback is not None:
+        # メンバー表を読めなくても、出場した試合なら出場履歴に残っている
+        try:
+            df, _ = jl_history_df(player)
+            cup = fallback(player, df, season_start)
+        except ScrapeError as e:
+            log(f"{label}(出場履歴)の確認にも失敗: {e.summary()}", "WARN")
+            return rows
+        if cup is not None:
+            debug(f"{label}はメンバー表を読めなかったため出場履歴から作成")
+    if cup is None:
+        return rows
+    if any(r["日付"] == cup["日付"] and r["試合"] == cup["試合"] for r in rows):
+        debug(f"{label}の試合は1行目と同じなので追加しない")
+        return rows
+    log(f"{label}の出場記録を追加: {cup['日付']} {cup['ステータス']}")
+    rows.append(cup)
+    return rows
+
+
 def with_emperor_row(rows, player, season_start):
     """天皇杯の最新試合があれば行を足して返す
 
     天皇杯はJFA主催のため、Jリーグ公式の出場履歴にも Football-LAB にも載らない。
     クラブページの試合ログから今季の天皇杯を探し、試合ページのメンバー表で
-    出場区分を決める。メンバー表を見るのでベンチ外も判別できる。
+    出場区分を決める。
     """
-    try:
-        cup = jl_emperor_row(player, season_start)
-    except ScrapeError as e:
-        log(f"天皇杯の確認に失敗: {e.summary()}", "WARN")
-        return rows
-    if cup is None:
-        return rows
-    if any(r["日付"] == cup["日付"] and r["試合"] == cup["試合"] for r in rows):
-        debug("天皇杯の試合は1行目と同じなので追加しない")
-        return rows
-    log(f"天皇杯の出場記録を追加: {cup['日付']} {cup['ステータス']}")
-    rows.append(cup)
-    return rows
+    return with_cup_row(rows, player, season_start, jl_emperor_row, EMPEROR)
 
 
 def with_jl_history_row(rows, player, season_start, build_row, label):
@@ -1297,19 +1332,26 @@ def with_jl_history_row(rows, player, season_start, build_row, label):
 
 
 def with_u21_row(rows, player, season_start):
-    """U-21 Ｊリーグの最新試合があれば行を足して返す"""
-    return with_jl_history_row(rows, player, season_start,
-                               jl_u21_row, "U-21 Ｊリーグ")
+    """U-21 Ｊリーグの最新試合があれば行を足して返す
+
+    日程ページから今季の試合を探し、試合ページのメンバー表で出場区分を
+    決めるのでベンチ外も判別できる。試合ページを読めなかったときだけ
+    出場履歴に落とす(その場合はベンチ外を判別できない)。
+    """
+    return with_cup_row(rows, player, season_start,
+                        jl_u21_cup_row, U21, fallback=jl_u21_row)
 
 
 def with_levain_row(rows, player, season_start):
     """ルヴァンカップの最新試合があれば行を足して返す
 
-    ルヴァンカップは Football-LAB がデータを持っていないため、
-    Jリーグ公式の出場履歴からしか拾えない。
+    ルヴァンカップは Football-LAB がデータを持っていない。天皇杯と同じく
+    クラブページの試合ログ→試合ページのメンバー表を読むので、ベンチ外も
+    判別できる。試合ページを読めなかったときだけ出場履歴に落とす
+    (その場合はベンチ外を判別できない)。
     """
-    return with_jl_history_row(rows, player, season_start,
-                               jl_levain_row, LEVAIN)
+    return with_cup_row(rows, player, season_start,
+                        jl_levain_cup_row, LEVAIN, fallback=jl_levain_row)
 
 
 def _footballlab_row(player, latest):
@@ -1784,9 +1826,13 @@ JL_CLUB_URL = "https://www.jleague.jp/club/{slug}/"
 RE_JL_CLUB_SLUG = re.compile(r'clubId\\*"\s*:\s*\\*"([A-Za-z0-9_-]+)\\*"')
 RE_JL_PLAYER_ID = re.compile(r"/player/(\d+)")
 RE_JL_ALL_MEMBERS = re.compile(r'"allMemberIds"\s*:\s*(\[[^\]]*\])')
+# "m-lineup-list-item" と "subs" の間には "ref" のほかに属性が入ることがある。
+#   通常          ..."m-lineup-list-item","ref":"$undefined","subs":[...]
+#   警告を受けた選手 ..."m-lineup-list-item","ref":"$undefined","card":"yellow","subs":[...]
+# 属性を決め打ちすると、警告を受けた選手の交代情報だけを取りこぼす。
 RE_JL_LINEUP_SUBS = re.compile(
-    r'"m-lineup-list-item","ref":"[^"]*","subs":(\[[^\]]*\]).{0,400}?"memberId":"(\d+)"',
-    re.S)
+    r'"m-lineup-list-item"(?:,"[A-Za-z]+":"[^"]*")*?,"subs":(\[[^\]]*\])'
+    r'.{0,400}?"memberId":"(\d+)"', re.S)
 RE_JL_MATCH_EVENT = re.compile(
     r'"eventType":"(goal|yellow-card|red-card)",'
     r'"legacyPlayerPhotoLookup":\{[^}]*?"playerId":"(\d+)"')
@@ -1859,9 +1905,12 @@ def jl_club_games(slug, name_ja=""):
     return games
 
 
-def jl_emperor_url(game_id):
-    """gameId 2026081917 → https://www.jleague.jp/match/emperor/2026/081917/"""
-    return f"https://www.jleague.jp/match/emperor/{game_id[:4]}/{game_id[4:]}/"
+def jl_match_url(game_id, path):
+    """gameId 2026081917 → https://www.jleague.jp/match/<path>/2026/081917/
+
+    path は大会ごとのURL断片(天皇杯 emperor / ルヴァンカップ leaguecup)。
+    """
+    return f"https://www.jleague.jp/match/{path}/{game_id[:4]}/{game_id[4:]}/"
 
 
 def jl_match_members(html):
@@ -1902,8 +1951,12 @@ def jl_match_members(html):
     return starters, members, subs, events
 
 
-def jl_emperor_status(player_id, starters, members, subs):
-    """メンバー表から、その選手の出場区分と出場時間の表示を決める"""
+def jl_member_status(player_id, starters, members, subs):
+    """メンバー表から、その選手の出場区分と出場時間の表示を決める
+
+    メンバー表(allMemberIds)に名前が無ければベンチ外と判定できる。
+    出場履歴しか見ない大会(U-21 Ｊリーグ)との精度の差はここから来る。
+    """
     events = subs.get(player_id) or []
 
     def minute(kind):
@@ -1926,41 +1979,226 @@ def jl_emperor_status(player_id, starters, members, subs):
     return OUT_SQUAD, ""
 
 
-def jl_emperor_row(player, season_start):
-    """今季の天皇杯の最新試合から、その選手の出場状況を1行にする。無ければ None"""
+def jl_cup_row(player, season_start, league, path):
+    """今季のカップ戦の最新試合から、その選手の出場状況を1行にする。無ければ None
+
+    クラブページの試合ログで対象大会の試合を見つけ、その試合ページの
+    メンバー表を読む。メンバー表を見るのでベンチ外も判別できる。
+
+    league … クラブページの試合ログに出る大会名(天皇杯 / ルヴァンカップ)
+    path   … 試合ページのURL断片(emperor / leaguecup)
+    """
     m = RE_JL_PLAYER_ID.search(player.get("jleague_url") or "")
     slug = jl_page_value(player, "slug")
     if not m or not slug:
-        debug("選手IDまたはクラブslugが取れないため天皇杯をスキップ")
+        debug(f"選手IDまたはクラブslugが取れないため{league}をスキップ")
         return None
     player_id = m.group(1)
 
     # クラブページの試合ログは過去シーズン分も含むので、今季開幕以降に絞る
     floor = season_start or date(CFG["year"], 1, 1)
     cup = [g for g in jl_club_games(slug, player["name_ja"])
-           if EMPEROR in g["league"] and g["date"] and g["date"] >= floor and g["game_id"]]
+           if league in g["league"] and g["date"] and g["date"] >= floor and g["game_id"]]
     if not cup:
-        debug(f"{CFG['year']}シーズンの天皇杯の試合は無し")
+        debug(f"{CFG['year']}シーズンの{league}の試合は無し")
         return None
 
     latest = max(cup, key=lambda g: g["date"])
-    match_url = jl_emperor_url(latest["game_id"])
+    match_url = jl_match_url(latest["game_id"], path)
     html = fetch(match_url)
-    save_html(html, f"{player['name_ja']}_emperor")
+    save_html(html, f"{player['name_ja']}_{path}")
     starters, members, subs, events = jl_match_members(html)
     if not members:
-        raise ScrapeError("天皇杯の試合ページからメンバー表を取得できない",
+        raise ScrapeError(f"{league}の試合ページからメンバー表を取得できない",
                           "--save-html でHTMLを保存し構造を確認する", match_url)
 
-    status, minutes_text = jl_emperor_status(player_id, starters, members, subs)
+    status, minutes_text = jl_member_status(player_id, starters, members, subs)
     played = status in (STARTER, SUBBED_IN)
     ev = events.get(player_id) or {}
     row = result(player, status, match=latest["opponent"],
                  date=latest["date"].strftime("%Y-%m-%d"),
-                 url=match_url, league=EMPEROR, match_result=latest["result"],
+                 url=match_url, league=league, match_result=latest["result"],
                  goals=str(ev.get("goal", 0)) if played else "",
                  cards=f"{ev.get('yellow-card', 0)}/{ev.get('red-card', 0)}" if played else "",
-                 note="Jリーグ公式(天皇杯)")
+                 note=f"Jリーグ公式({league})")
+    row["出場時間"] = minutes_text
+    return row
+
+
+def jl_emperor_row(player, season_start):
+    """今季の天皇杯の最新試合から、その選手の出場状況を1行にする。無ければ None"""
+    return jl_cup_row(player, season_start, EMPEROR, "emperor")
+
+
+def jl_levain_cup_row(player, season_start):
+    """今季のルヴァンカップの最新試合から、その選手の出場状況を1行にする"""
+    return jl_cup_row(player, season_start, LEVAIN, "leaguecup")
+
+
+# =========================================================
+# U-21 Ｊリーグ (日程検索ページ + 試合ページ)
+#
+# U-21 Ｊリーグはクラブページの試合ログに載らないため、天皇杯のように
+# 「出場していない試合」を見つける入口が長らく無かった。日程検索ページなら
+# 期間を指定して今季の全試合を取れるので、そこからクラブの試合を探す。
+#   https://www.jleague.jp/u-21/match/search-list/
+#       ?startdate=2026-03-01&enddate=2026-09-03&period=custom
+# &club=<クラブID> を付けると、そのクラブの試合だけに絞れる。
+# U-21 Ｊリーグに参加しているクラブは一部だけなので、players.json に
+# u21_club_id を書いた選手だけを対象にする(未記入なら一覧を取りに行かない)。
+#
+# なお絞り込まずに取ると、ReactのSuspenseで一部のカードが遅延配信され、
+# requests では中身が <template id="P:n"> のままの試合が混じる
+# (2026年9月時点で5件中2件)。数試合だけ静かに欠けるとベンチ外の判定を誤るため、
+# リンク数とパースできた数が食い違ったときはブラウザ描画で取り直す。
+# 1試合分のDOM:
+#   <div class="m-schedule__wrapper">
+#     <a class="m-schedule__link" href="/match/u-21/2026/082309/">
+#       <div class="m-schedule__team-home">
+#         <span class="m-schedule__team-name" data-media="pc">U-21 ファジアーノ岡山</span>
+#         <span class="m-schedule__team-name" data-media="sp">U-21岡山</span>
+#       <p class="m-schedule__score">0</p> 試合終了 <p class="m-schedule__score">1</p>
+#       <div class="m-schedule__team-away"> ... U-21 ガンバ大阪
+# 試合IDは href の 6桁(月日+連番)。日付もここから決まる。
+# =========================================================
+U21 = "U-21 Ｊリーグ"
+U21_SEARCH_URL = ("https://www.jleague.jp/u-21/match/search-list/"
+                  "?startdate={start}&enddate={end}&period=custom&club={club}")
+# U-21 Ｊリーグの開幕月。日程検索の開始日に使う(2026年は8月末に開幕)
+U21_OPENING_MONTH = 8
+RE_U21_MATCH_HREF = re.compile(r"/match/u-21/(\d{4})/(\d{6})/")
+# {(開始日, 終了日, クラブID): 試合リスト} — 同じクラブの選手で使い回す
+_JL_U21_CACHE = {}
+
+
+def jl_u21_games(club_id):
+    """U-21 Ｊリーグの、そのクラブの今季の消化済み試合を返す
+
+    U-21 Ｊリーグは8月開幕なので、検索期間は今季の8月1日から当日まで。
+    Football-LAB から得る season_start はレポートページに出ている範囲までしか
+    遡らないため、それを開始日にすると開幕直後の試合を取りこぼすことがある。
+    """
+    opening = date(CFG["year"], U21_OPENING_MONTH, 1)
+    today = date.today()
+    if today < opening:
+        debug(f"{U21}は{CFG['year']}年{U21_OPENING_MONTH}月開幕のためまだ試合が無い")
+        return []
+    start, end = opening.strftime("%Y-%m-%d"), today.strftime("%Y-%m-%d")
+    key = (start, end, club_id)
+    if key in _JL_U21_CACHE:
+        return _JL_U21_CACHE[key]
+
+    url = U21_SEARCH_URL.format(start=start, end=end, club=club_id)
+    html = fetch(url)
+    games = jl_u21_parse_games(html, url)
+    # 遅延配信で中身が届いていない試合があれば、ブラウザで取り直す
+    linked = {m[1] for m in RE_U21_MATCH_HREF.findall(html)}
+    if len(games) < len(linked):
+        debug(f"{U21}の日程: リンク{len(linked)}件に対しパースできたのは{len(games)}件。"
+              f"ブラウザで取り直します")
+        try:
+            html = render(url, wait_selector="div.m-schedule__wrapper",
+                          locale="ja-JP", scroll=True)
+            games = jl_u21_parse_games(html, url)
+        except ScrapeError as e:
+            log(f"{U21}の日程をブラウザで取得できません({e.message})。"
+                f"一部の試合が欠けたまま判定します", "WARN")
+    save_html(html, f"u21_search_{club_id}")
+    debug(f"{U21}の日程({start}〜{end} club={club_id}): 消化済み{len(games)}試合")
+    _JL_U21_CACHE[key] = games
+    return games
+
+
+def jl_u21_parse_games(html, base_url):
+    """日程検索ページから、結果の出ている試合だけを取り出す"""
+    soup = BeautifulSoup(html, "lxml")
+    games = []
+    for card in soup.select("div.m-schedule__wrapper"):
+        link = card.select_one("a[href*='/match/u-21/']")
+        if link is None:
+            continue
+        m = RE_U21_MATCH_HREF.search(link["href"])
+        if not m:
+            continue
+        year, tail = m.group(1), m.group(2)
+        try:
+            when = date(int(year), int(tail[:2]), int(tail[2:4]))
+        except ValueError:
+            debug(f"U-21の試合IDから日付にできない: {year}/{tail}")
+            continue
+        scores = [s.get_text(strip=True) for s in card.select("p.m-schedule__score")]
+        if len(scores) < 2 or not all(s.isdigit() for s in scores[:2]):
+            continue  # 未消化(キックオフ時刻だけの表示)
+        names = {}
+        for side in ("home", "away"):
+            box = card.select_one(f"div.m-schedule__team-{side}")
+            if box is None:
+                continue
+            names[side] = {
+                media: (box.select_one(f"span.m-schedule__team-name[data-media={media}]")
+                        or box).get_text(strip=True)
+                for media in ("pc", "sp")}
+        if len(names) < 2:
+            continue
+        games.append({
+            "date": when,
+            "game_id": f"{year}{tail}",
+            "url": urljoin(base_url, link["href"]),
+            "home": names["home"]["pc"], "home_short": names["home"]["sp"],
+            "away": names["away"]["pc"], "away_short": names["away"]["sp"],
+            "home_goals": int(scores[0]), "away_goals": int(scores[1]),
+        })
+    return games
+
+
+def jl_u21_cup_row(player, season_start):
+    """U-21 Ｊリーグの最新試合をメンバー表から1行にする。無ければ None
+
+    出場履歴と違い、日程から試合を探して試合ページのメンバー表を読むので、
+    出場しなかった試合もベンチ入りのみ/ベンチ外として判別できる。
+    """
+    club_id = str(player.get("u21_club_id", "")).strip()
+    if not club_id:
+        # 所属クラブが U-21 Ｊリーグに参加していない(=大半の選手)。
+        # 一覧を取りに行かず、出場履歴からの組み立てに任せる。
+        debug(f"u21_club_id が未設定のため{U21}の日程は見ない")
+        return None
+    m = RE_JL_PLAYER_ID.search(player.get("jleague_url") or "")
+    club = norm(player.get("club", ""))
+    if not m or not club:
+        debug(f"選手IDまたはクラブ名が取れないため{U21}をスキップ")
+        return None
+    player_id = m.group(1)
+
+    mine = [g for g in jl_u21_games(club_id)
+            if club in norm(g["home"]) or club in norm(g["away"])]
+    if not mine:
+        debug(f"{CFG['year']}シーズンの{U21}に {player['club']} の試合は無し")
+        return None
+
+    latest = max(mine, key=lambda g: g["date"])
+    is_home = club in norm(latest["home"])
+    html = fetch(latest["url"])
+    save_html(html, f"{player['name_ja']}_u21")
+    starters, members, subs, events = jl_match_members(html)
+    if not members:
+        raise ScrapeError(f"{U21}の試合ページからメンバー表を取得できない",
+                          "--save-html でHTMLを保存し構造を確認する", latest["url"])
+
+    status, minutes_text = jl_member_status(player_id, starters, members, subs)
+    played = status in (STARTER, SUBBED_IN)
+    ev = events.get(player_id) or {}
+    scored, conceded = ((latest["home_goals"], latest["away_goals"]) if is_home
+                        else (latest["away_goals"], latest["home_goals"]))
+    outcome = "勝" if scored > conceded else "負" if scored < conceded else "分"
+    row = result(player, status,
+                 match=latest["away_short"] if is_home else latest["home_short"],
+                 date=latest["date"].strftime("%Y-%m-%d"),
+                 url=latest["url"], league=U21,
+                 match_result=f"{outcome} {scored}-{conceded}",
+                 goals=str(ev.get("goal", 0)) if played else "",
+                 cards=f"{ev.get('yellow-card', 0)}/{ev.get('red-card', 0)}" if played else "",
+                 note=f"Jリーグ公式({U21})")
     row["出場時間"] = minutes_text
     return row
 
@@ -3273,6 +3511,7 @@ def main():
     _JL_HISTORY_CACHE.clear()
     _JL_CLUB_CACHE.clear()
     _BS_HTML_CACHE.clear()
+    _JL_U21_CACHE.clear()
     rows, errors, success = [], [], 0
     for p in targets:
         print(f"■ {p['name_ja']} ({p['club']}) [{p['source']}]")

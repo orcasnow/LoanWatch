@@ -128,6 +128,26 @@ TEAM_URLS = {
 
 TEAM_CHOICES = tuple(TEAM_URLS)
 
+# U-21 Ｊリーグに参加しているクラブと、日程ページの絞り込みに使うクラブID。
+#   https://www.jleague.jp/u-21/match/ でクラブを選んだときのURLに付く
+#   &club=<この数字> (2026シーズン)
+# ここに無いクラブは U-21 Ｊリーグに参加していないので、クラブを選ぶと
+# U-21クラブID欄は空になる。シーズンが変わって参加クラブが入れ替わったら、
+# この表を書き換える。
+U21_CLUB_IDS = {
+    "浦和レッズ": "33180",
+    "FC東京": "33181",
+    "東京ヴェルディ": "33182",
+    "川崎フロンターレ": "33183",
+    "清水エスパルス": "33184",
+    "ジュビロ磐田": "33185",
+    "名古屋グランパス": "33186",
+    "ガンバ大阪": "33187",
+    "ヴィッセル神戸": "33188",
+    "ファジアーノ岡山": "33189",
+    "V・ファーレン長崎": "33190",
+}
+
 TABLE_COLUMNS = (
     "name_ja",
     "name_en",
@@ -137,6 +157,7 @@ TABLE_COLUMNS = (
     "espn_team",
     "espn_team_id",
     "jleague_url",
+    "u21_club_id",
     "url",
     "besoccer",
 )
@@ -150,6 +171,7 @@ HEADINGS = {
     "espn_team": "ESPNチーム",
     "espn_team_id": "ESPNチームID",
     "jleague_url": "JリーグURL",
+    "u21_club_id": "U-21クラブID",
     "url": "URL",
     "besoccer": "BeSoccer追加チーム",
 }
@@ -173,6 +195,7 @@ KNOWN_FORM_FIELDS = {
     "espn_team",
     "espn_team_id",
     "jleague_url",
+    "u21_club_id",
     *BESOCCER_FORM_FIELDS,
 }
 
@@ -194,6 +217,7 @@ OUTPUT_FIELDS_BY_SOURCE = {
         "source",
         "url",
         "jleague_url",
+        "u21_club_id",
     ),
 }
 
@@ -671,7 +695,19 @@ class PlayersEditor(tk.Tk):
             ttk.Entry(self.source_frame, textvariable=self.vars["jleague_url"]).grid(
                 row=1, column=1, columnspan=3, sticky="ew", padx=(0, 8), pady=4
             )
-            self.build_besoccer_fields(2)
+
+            ttk.Label(self.source_frame, text="U-21クラブID").grid(
+                row=2, column=0, sticky="w", padx=(8, 4), pady=4
+            )
+            ttk.Entry(self.source_frame, textvariable=self.vars["u21_club_id"]).grid(
+                row=2, column=1, sticky="ew", padx=(0, 8), pady=4
+            )
+            ttk.Label(
+                self.source_frame,
+                text="(クラブを選ぶと自動で入ります。U-21 Ｊリーグ不参加クラブは空欄)",
+            ).grid(row=2, column=2, columnspan=2, sticky="w", padx=(8, 4), pady=4)
+
+            self.build_besoccer_fields(3)
             return
 
         if source == "espn":
@@ -857,9 +893,13 @@ class PlayersEditor(tk.Tk):
     def on_club_change(self, _event=None):
         if self.source_var.get() != "football-lab":
             return
-        url = TEAM_URLS.get(self.vars["club"].get().strip())
+        club = self.vars["club"].get().strip()
+        url = TEAM_URLS.get(club)
         if url:
             self.vars["url"].set(url)
+        # U-21 Ｊリーグ参加クラブなら自動で入れる。参加していなければ空にする
+        # (クラブを選び直したとき、前のクラブのIDが残らないように)
+        self.vars["u21_club_id"].set(U21_CLUB_IDS.get(club, ""))
         self.schedule_player_search()
 
     def on_name_change(self, *_args):
@@ -976,6 +1016,12 @@ class PlayersEditor(tk.Tk):
             required_fields.append(("name_en", "選手名(英語)"))
             required_fields.append(("espn_id", "ESPN ID"))
         missing = [label for field, label in required_fields if not self.vars[field].get().strip()]
+        u21 = self.vars["u21_club_id"].get().strip()
+        if u21 and not u21.isdigit():
+            messagebox.showerror("入力エラー",
+                                 "U-21クラブIDは数字で入力してください\n"
+                                 "(U-21日程ページで絞り込んだURLの &club= の値)")
+            return False
         # BeSoccer欄は丸ごと空欄なら使わない。1つでも書いたら必須3項目をそろえる
         if any(self.vars[field].get().strip() for field in BESOCCER_FORM_FIELDS):
             missing += [label for field, label in BESOCCER_REQUIRED
