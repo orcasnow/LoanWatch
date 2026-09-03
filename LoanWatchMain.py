@@ -1,8 +1,8 @@
 """LoanWatch - 名古屋グランパス レンタル移籍選手の最新試合 出場ステータス一覧
 
 出力: 選手ごと1行 (先発 / 途中出場 / ベンチ入りのみ / ベンチ外 / 試合なし)
-      ただしトップチームのほかに U-21 Ｊリーグ・天皇杯にも今季の記録がある
-      選手は、大会ごとに1行ずつ出力する。
+      ただしトップチームのほかに U-21 Ｊリーグ・ルヴァンカップ・天皇杯にも
+      今季の記録がある選手は、大会ごとに1行ずつ出力する。
       players.json に besoccer 設定を書いた選手は、ESPN・Football-LAB に
       載らないチーム(アルヘンティノス・ジュニアーズIIなどのリザーブチーム)の
       行も BeSoccer から取得して追加する。
@@ -25,7 +25,8 @@ GUI版:
 
 出力列:
     日付 / 経過 を先頭寄りに置き、いつの試合かがひと目で分かるようにしている。
-    リーグ名 はその試合の大会名(明治安田Ｊ１ / U-21 Ｊリーグ / 天皇杯 / ESPNは英語表記)。
+    リーグ名 はその試合の大会名(明治安田Ｊ１ / U-21 Ｊリーグ / ルヴァンカップ /
+    天皇杯 / ESPNは英語表記)。
     ベンチ外・ベンチ入りのみは大会名を特定できないため、Jリーグ公式の
     所属リーグで代用し、備考に「リーグ名は所属リーグから推定」と入れる。
     試合 は対戦相手のみ、試合結果 は対象クラブ視点の勝敗・スコア。
@@ -1241,11 +1242,12 @@ def scrape_footballlab(player):
 
 
 def with_other_competitions(rows, player, season_start):
-    """トップチームのリーグ戦以外(U-21 Ｊリーグ・天皇杯)の行を足す"""
+    """トップチームのリーグ戦以外(U-21 Ｊリーグ・ルヴァンカップ・天皇杯)の行を足す"""
     if CFG.get("no_fallback") or not player.get("jleague_url"):
         return rows
-    return with_emperor_row(with_u21_row(rows, player, season_start),
-                            player, season_start)
+    rows = with_u21_row(rows, player, season_start)
+    rows = with_levain_row(rows, player, season_start)
+    return with_emperor_row(rows, player, season_start)
 
 
 def with_emperor_row(rows, player, season_start):
@@ -1270,28 +1272,44 @@ def with_emperor_row(rows, player, season_start):
     return rows
 
 
-def with_u21_row(rows, player, season_start):
-    """U-21 Ｊリーグの最新試合があれば行を足して返す
+def with_jl_history_row(rows, player, season_start, build_row, label):
+    """Jリーグ公式の出場履歴から作った大会別の行を足して返す
 
-    トップチームの行は Football-LAB のレポート(=リーグ戦・カップ戦)から作るため、
-    U-21 Ｊリーグの出場はJリーグ公式の出場履歴からしか拾えない。
+    出場履歴は1回の実行中キャッシュされるので、大会ごとに呼んでも
+    選手ページへのアクセスは増えない。
     """
     try:
         df, _ = jl_history_df(player)
     except ScrapeError as e:
-        log(f"U-21 Ｊリーグの確認に失敗: {e.summary()}", "WARN")
+        log(f"{label}の確認に失敗: {e.summary()}", "WARN")
         return rows
-    u21 = jl_u21_row(player, df, season_start)
-    if u21 is None:
+    extra = build_row(player, df, season_start)
+    if extra is None:
         return rows
     # Football-LAB が取れずJリーグ公式に落ちた場合、1行目自体が
-    # U-21 の試合ということがある。その時は二重に出さない。
-    if any(r["日付"] == u21["日付"] and r["試合"] == u21["試合"] for r in rows):
-        debug("U-21 Ｊリーグの試合は1行目と同じなので追加しない")
+    # その大会の試合ということがある。その時は二重に出さない。
+    if any(r["日付"] == extra["日付"] and r["試合"] == extra["試合"] for r in rows):
+        debug(f"{label}の試合は1行目と同じなので追加しない")
         return rows
-    log(f"U-21 Ｊリーグの出場履歴を追加: {u21['日付']} {u21['ステータス']}")
-    rows.append(u21)
+    log(f"{label}の出場履歴を追加: {extra['日付']} {extra['ステータス']}")
+    rows.append(extra)
     return rows
+
+
+def with_u21_row(rows, player, season_start):
+    """U-21 Ｊリーグの最新試合があれば行を足して返す"""
+    return with_jl_history_row(rows, player, season_start,
+                               jl_u21_row, "U-21 Ｊリーグ")
+
+
+def with_levain_row(rows, player, season_start):
+    """ルヴァンカップの最新試合があれば行を足して返す
+
+    ルヴァンカップは Football-LAB がデータを持っていないため、
+    Jリーグ公式の出場履歴からしか拾えない。
+    """
+    return with_jl_history_row(rows, player, season_start,
+                               jl_levain_row, LEVAIN)
 
 
 def _footballlab_row(player, latest):
@@ -1423,6 +1441,12 @@ JL_APPEARANCE = {"start": "先発", "sub": "サブ"}
 JL_OUTCOME = {"win": "勝", "draw": "分", "loss": "負"}
 # 大会名 "U-21 Ｊリーグ" の判定用(NFKC正規化してから照合する)
 RE_U21 = re.compile(r"U-?21", re.I)
+# ルヴァンカップの判定用。埋め込みJSONから読めたときは大会ID(gameKindId)が
+# 4 で安定しているのでそれを使い、HTMLの表に落ちて大会IDが無い場合に備えて
+# 名称でも照合する(ナビスコカップ時代の表記も拾う)。
+LEVAIN = "ルヴァンカップ"
+LEVAIN_KIND = "4"
+RE_LEVAIN = re.compile(r"ルヴァン|ナビスコ")
 # 選手ページが持つ「現在の所属リーグ」。埋め込みJSONの入れ子の深さによって
 # 引用符のエスケープ(\")が付いたり付かなかったりするため \\* で吸収する。
 #   ..."gameKindName":"２０２６／２７明治安田Ｊ１リーグ","gameKindId":2...
@@ -1684,34 +1708,58 @@ def jl_status_from_row(row, columns):
     return BENCH, ""
 
 
-def jl_u21_row(player, df, season_start):
-    """出場履歴から U-21 Ｊリーグの今季最新試合を1行にする。無ければ None
+def jl_latest_comp_row(player, df, season_start, is_target, label):
+    """出場履歴から、ある大会の今季最新試合を1行にする。無ければ None
 
-    U-21 Ｊリーグはトップチームとは別日程で開催されるため、Football-LAB の
-    マッチレポートには載らない。両方に出場している選手を1行にまとめると
-    どちらかが消えてしまうので、大会ごとに別の行として出す。
+    トップチームの行は Football-LAB のレポート(=リーグ戦)から作るため、
+    別日程で行われる大会はJリーグ公式の出場履歴からしか拾えない。1行に
+    まとめるとどちらかの試合が見えなくなるので、大会ごとに別の行として出す。
+
+    is_target(大会名, 大会ID) が True を返す行だけを対象にする。大会名は
+    NFKC正規化済み、大会IDは埋め込みJSONから読めた場合だけ入る。
     """
     if df.empty:
         return None
     comp_col = find_col(df.columns, [JL_COL_COMP])
     if comp_col is None:
-        debug("出場履歴に大会列が無いためU-21の判定をスキップ")
+        debug(f"出場履歴に大会列が無いため{label}の判定をスキップ")
         return None
-    u21 = df[df[comp_col].map(lambda v: bool(RE_U21.search(norm(v))))]
+    kinds = df["_kind"] if "_kind" in df.columns else pd.Series("", index=df.index)
+    target = df[[bool(is_target(norm(comp), str(kind)))
+                 for comp, kind in zip(df[comp_col], kinds)]]
     # 出場履歴は過去シーズン分も含むため、今季の記録だけに絞る
-    u21 = u21[u21["_date"] >= (season_start or date(CFG["year"], 1, 1))]
-    if u21.empty:
+    target = target[target["_date"] >= (season_start or date(CFG["year"], 1, 1))]
+    if target.empty:
         return None
 
-    latest = u21.iloc[-1]
+    latest = target.iloc[-1]
     status, minutes_text = jl_status_from_row(latest, df.columns)
     row = result(player, status, match=jl_value(latest, df.columns, JL_COL_OPP),
                  date=latest["_date"].strftime("%Y-%m-%d"),
                  url=player.get("jleague_url") or player.get("url"),
-                 note="Jリーグ公式(U-21 Ｊリーグ) / ベンチ外は判別不可")
+                 note=f"Jリーグ公式({label}) / ベンチ外は判別不可")
     row.update(jl_extra_fields(latest, df.columns))
     row["出場時間"] = minutes_text
     return row
+
+
+def jl_u21_row(player, df, season_start):
+    """出場履歴から U-21 Ｊリーグの今季最新試合を1行にする。無ければ None"""
+    return jl_latest_comp_row(player, df, season_start,
+                              lambda comp, kind: RE_U21.search(comp),
+                              "U-21 Ｊリーグ")
+
+
+def jl_levain_row(player, df, season_start):
+    """出場履歴から ルヴァンカップ の今季最新試合を1行にする。無ければ None
+
+    ルヴァンカップは Football-LAB がデータを持っていないため、Jリーグ公式の
+    出場履歴からしか拾えない。
+    """
+    return jl_latest_comp_row(
+        player, df, season_start,
+        lambda comp, kind: kind == LEVAIN_KIND or RE_LEVAIN.search(comp),
+        LEVAIN)
 
 
 # =========================================================
