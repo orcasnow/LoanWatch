@@ -629,7 +629,12 @@ def fetch(url):
             elif r.status_code >= 500:
                 last = ScrapeError(f"HTTP {r.status_code} サーバ側エラー", "時間をおいて再実行", url)
             else:
-                r.encoding = r.apparent_encoding
+                # Content-Type に charset があればそれが正解。apparent_encoding
+                # (charset_normalizerの推定)で上書きすると、まれに ptcp154 などの
+                # 全バイトに文字が割り当たった文字コードが選ばれ、例外も出ないまま
+                # 日本語が化ける。宣言が無いサイトのときだけ推測に頼る。
+                if "charset" not in r.headers.get("Content-Type", "").lower():
+                    r.encoding = r.apparent_encoding or "utf-8"
                 html = r.text
                 if len(html) < 2000:
                     raise ScrapeError(f"応答が異常に短い({len(html)}文字)",

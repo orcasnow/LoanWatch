@@ -3,6 +3,9 @@
 ここだけを書き換える。LoanWatchMain.py(CUI)・LoanWatchGui.py(GUI)・
 PlayersEditor.py(選手設定画面)が、この値を読んで表示する。
 
+  4.0.1  HTTPヘッダーが文字コードを宣言している場合は、その宣言を使うようにした。
+         推測(apparent_encoding)で上書きしていたため、まれに UTF-8 の応答が
+         PTCP154 等と誤判定され、リーグ名などが文字化けすることがあった。
   4.0    U-21 Ｊリーグのチーム単位取得に対応。指定したU-21クラブの最新試合の
          メンバー表を全員分、Excelの別シート「U-21最新試合」へ出力する
          (対象クラブは u21_clubs.json・GUIのプルダウン・--u21-club で選択)。
@@ -20,4 +23,4 @@ PlayersEditor.py(選手設定画面)が、この値を読んで表示する。
   2.1    GUI版
 """
 
-APP_VERSION = "4.0"
+APP_VERSION = "4.0.1"
