@@ -1,0 +1,17 @@
+{
+  "_comment": "U-21 Ｊリーグのクラブ一覧。id は日程検索ページ /u-21/match/search-list/ の &club= の値。default に書いたクラブが既定の取得対象になる。",
+  "default": "33186",
+  "clubs": [
+    { "id": "33180", "name": "U-21 浦和レッズ",        "group": "EAST" },
+    { "id": "33181", "name": "U-21 ＦＣ東京",          "group": "EAST" },
+    { "id": "33182", "name": "U-21 東京ヴェルディ",     "group": "EAST" },
+    { "id": "33183", "name": "U-21 川崎フロンターレ",   "group": "EAST" },
+    { "id": "33184", "name": "U-21 清水エスパルス",     "group": "EAST" },
+    { "id": "33185", "name": "U-21 ジュビロ磐田",       "group": "EAST" },
+    { "id": "33186", "name": "U-21 名古屋グランパス",   "group": "WEST" },
+    { "id": "33187", "name": "U-21 ガンバ大阪",         "group": "WEST" },
+    { "id": "33188", "name": "U-21 ヴィッセル神戸",     "group": "WEST" },
+    { "id": "33189", "name": "U-21 ファジアーノ岡山",   "group": "WEST" },
+    { "id": "33190", "name": "U-21 Ｖ・ファーレン長崎", "group": "WEST" }
+  ]
+}

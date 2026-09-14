@@ -18,10 +18,18 @@
     python LoanWatchMain.py --only 貴田遼河 --debug        # 1人だけ試す
     python LoanWatchMain.py --source espn --debug         # ESPN対象の2人だけ
     python LoanWatchMain.py --no-besoccer                 # BeSoccerの追加行を出さない
+    python LoanWatchMain.py --u21-club 33189 33186        # U-21シートの対象クラブ
+    python LoanWatchMain.py --no-u21-team                 # U-21シートを作らない
 
 GUI版:
     python LoanWatchGui.py            # 実行設定・ログ画面＋「選手設定を編集」ボタン
     python PlayersEditor.py           # players.json 編集画面を単体起動
+
+U-21 Ｊリーグ(チーム単位):
+    レンタル選手とは別に、指定したU-21クラブの最新試合のメンバー全員を
+    Excelの別シート「U-21最新試合」へ出力する。対象クラブは u21_clubs.json で
+    管理し、GUIのプルダウンまたは --u21-club で選ぶ(既定は名古屋グランパス)。
+    メンバー表に載らないベンチ外の選手は、この方式では出力されない。
 
 出力列:
     日付 / 経過 を先頭寄りに置き、いつの試合かがひと目で分かるようにしている。
@@ -29,7 +37,7 @@ GUI版:
     天皇杯 / ESPNは英語表記)。
     ベンチ外・ベンチ入りのみは大会名を特定できないため、Jリーグ公式の
     所属リーグで代用し、備考に「リーグ名は所属リーグから推定」と入れる。
-    試合 は対戦相手のみ、試合結果 は対象クラブ視点の勝敗・スコア。
+    対戦相手 は相手クラブ名のみ、試合結果 は対象クラブ視点の勝敗・スコア。
     警告/退場 は「警告数/退場数」で表示する。
     --stale-days で指定した日数より古い試合しか取れなかった選手は末尾に列挙する。
 """
@@ -51,6 +59,7 @@ from io import StringIO
 from pathlib import Path
 from urllib.parse import urljoin, urlparse, parse_qs
 
+import u21_clubs
 from version import APP_VERSION
 
 
@@ -107,7 +116,7 @@ KW_SUBIN_COL = ["交代IN", "投入", "途中出場"]
 RE_CANCELLED = re.compile(r"(中止|延期|試合データがありません|データはありません)")
 
 COLUMNS = ["選手", "クラブ", "リーグ名", "日付", "経過", "チーム最新試合日付", "ステータス",
-           "出場時間", "試合", "試合結果", "ゴール数", "警告/退場", "備考", "URL"]
+           "出場時間", "対戦相手", "試合結果", "ゴール数", "警告/退場", "備考", "URL"]
 RE_GAME_URL = re.compile(r"/soccer/match/_/gameId/(\d+)")
 
 HEADERS = {
@@ -310,7 +319,7 @@ def result(player, status, match="", date="", minutes=None, url=None, note="",
             "チーム最新試合日付": team_latest_date,
             "ステータス": status,
             "出場時間": f"{minutes}分" if minutes else "",
-            "試合": match,
+            "対戦相手": match,
             "試合結果": match_result,
             "ゴール数": goals,
             "警告/退場": cards,
@@ -1289,7 +1298,7 @@ def with_cup_row(rows, player, season_start, build_row, label, fallback=None):
             debug(f"{label}はメンバー表を読めなかったため出場履歴から作成")
     if cup is None:
         return rows
-    if any(r["日付"] == cup["日付"] and r["試合"] == cup["試合"] for r in rows):
+    if any(r["日付"] == cup["日付"] and r["対戦相手"] == cup["対戦相手"] for r in rows):
         debug(f"{label}の試合は1行目と同じなので追加しない")
         return rows
     log(f"{label}の出場記録を追加: {cup['日付']} {cup['ステータス']}")
@@ -1323,7 +1332,7 @@ def with_jl_history_row(rows, player, season_start, build_row, label):
         return rows
     # Football-LAB が取れずJリーグ公式に落ちた場合、1行目自体が
     # その大会の試合ということがある。その時は二重に出さない。
-    if any(r["日付"] == extra["日付"] and r["試合"] == extra["試合"] for r in rows):
+    if any(r["日付"] == extra["日付"] and r["対戦相手"] == extra["対戦相手"] for r in rows):
         debug(f"{label}の試合は1行目と同じなので追加しない")
         return rows
     log(f"{label}の出場履歴を追加: {extra['日付']} {extra['ステータス']}")
@@ -2201,6 +2210,197 @@ def jl_u21_cup_row(player, season_start):
                  note=f"Jリーグ公式({U21})")
     row["出場時間"] = minutes_text
     return row
+
+
+# =========================================================
+# U-21 Ｊリーグ チーム単位 (指定クラブの最新試合、メンバー表の全員)
+#
+# レンタル選手の追跡(選手 → 大会)とは向きが逆で、クラブ → 最新試合 →
+# メンバー全員 の順にたどる。players.json への選手登録は不要。
+#
+#   ① 日程検索 (club=<id>) から今季の消化済み試合 → 最新の1試合
+#   ② その試合ページのメンバー表を、そのクラブの選手だけ全員分ひらく
+#
+# 日程検索は必ず club を指定する。指定せずに取るとReactの遅延配信で
+# 試合カードの中身が届かず、静かに数試合欠ける(実測でリンク10件に対し
+# パースできたのは6件)。クラブを絞れば件数が少ないため欠落しない。
+#
+# 試合ページはRSCのストリーミング参照で書かれているが、参照先の実体も
+# 同じHTML内にあるため requests だけで全員分取れる。控え1人分の実体:
+#   1e0:["$","$Ld7","1657670",{"href":"/player/1657670", ...
+#        {"memberId":"1657670", ... "teamNameKey":"nagasaki" ...
+#        ..."m-lineup-list-item__position", ... "children":"GK 13"}
+#        ..."m-lineup-list-item__name", ... "children":"黒川 偉心"}
+#
+# ベンチ外はメンバー表に載らないため、この方式では出せない(仕様)。
+# =========================================================
+MAIN_SHEET = "レンタル選手"
+U21_SHEET = "U-21最新試合"
+U21_COLUMNS = ["背番号", "ポジション", "選手", "クラブ", "リーグ名", "日付", "経過",
+               "ステータス", "出場時間", "対戦相手", "試合結果", "ゴール数",
+               "警告/退場", "備考", "URL"]
+
+# メンバー1人分のかたまりは '"memberId":"<選手ID>"' で始まる。そこで区切って
+# から中を読むので、ある選手の項目を隣の選手の項目と取り違える余地がない。
+RE_U21_ITEM_ID = re.compile(r'^(\d+)"')
+RE_U21_TEAM_KEY = re.compile(r'"teamNameKey":"([A-Za-z0-9_-]+)"')
+RE_U21_ITEM_POS = re.compile(
+    r'm-lineup-list-item__position"[^}]{0,200}?"children":"([^"]*)"')
+RE_U21_ITEM_NAME = re.compile(
+    r'm-lineup-list-item__name"[^}]{0,200}?"children":"([^"]*)"')
+# "GK 13" → ポジション と 背番号
+RE_U21_POS_NO = re.compile(r"^([A-Za-z]+)\s*(\d*)$")
+
+
+def jl_match_team_keys(plain):
+    """試合ページから {'home': 'nagasaki', 'away': 'nagoya'} を作る
+
+    メンバー表の項目にはクラブ名が入っていないが teamNameKey は入っている。
+    先発の1人目から拾えば、どちらのクラブの項目かを確実に見分けられる。
+    """
+    keys = {}
+    for side, marker in (("home", '"homeTeam":{"teamName"'),
+                         ("away", '"awayTeam":{"teamName"')):
+        i = plain.find(marker)
+        if i < 0:
+            continue
+        for p in jl_json_after(plain[i:], '"players"', "[") or []:
+            key = (p.get("legacyPlayerPhotoLookup") or {}).get("teamNameKey")
+            if key:
+                keys[side] = str(key)
+                break
+    return keys
+
+
+def u21_lineup_items(plain):
+    """メンバー表を [{id, team_key, pos, no, name}] にする(表示順のまま)
+
+    表示順は 先発(GK→DF→MF→FW) → 控え なので、並べ替えずにそのまま使う。
+    """
+    items, seen = [], set()
+    for part in plain.split('"memberId":"')[1:]:
+        m = RE_U21_ITEM_ID.match(part)
+        if not m or m.group(1) in seen:
+            continue
+        team = RE_U21_TEAM_KEY.search(part)
+        pos = RE_U21_ITEM_POS.search(part)
+        name = RE_U21_ITEM_NAME.search(part)
+        if not (team and pos and name):
+            # allMemberIds には監督など、メンバー表に描画されない項目も混ざる
+            continue
+        seen.add(m.group(1))
+        pn = RE_U21_POS_NO.match(pos.group(1).strip())
+        items.append({
+            "id": m.group(1), "team_key": team.group(1),
+            "pos": pn.group(1) if pn else pos.group(1).strip(),
+            "no": pn.group(2) if pn else "",
+            "name": name.group(1),
+        })
+    return items
+
+
+def u21_team_side(game, club_name):
+    """対象クラブがホームかアウェーかを返す。判別できなければ None"""
+    want = norm(club_name)
+    if not want:
+        return None
+    for side in ("home", "away"):
+        if norm(game[side]) == want:
+            return side
+    for side in ("home", "away"):
+        if want in norm(game[side]) or norm(game[side]) in want:
+            return side
+    return None
+
+
+def u21_member_row(item, game, side, club, starters, members, subs, events):
+    """メンバー表の1人をExcelの1行にする"""
+    status, minutes_text = jl_member_status(item["id"], starters, members, subs)
+    played = status in (STARTER, SUBBED_IN)
+    ev = events.get(item["id"]) or {}
+    scored, conceded = ((game["home_goals"], game["away_goals"]) if side == "home"
+                        else (game["away_goals"], game["home_goals"]))
+    outcome = "勝" if scored > conceded else "負" if scored < conceded else "分"
+    when = game["date"].strftime("%Y-%m-%d")
+    return {
+        # 背番号はExcelで並べ替えられるよう数値のまま入れる
+        "背番号": int(item["no"]) if item["no"].isdigit() else item["no"],
+        "ポジション": item["pos"], "選手": item["name"],
+        "クラブ": club["name"], "リーグ名": U21,
+        "日付": when, "経過": format_elapsed(when),
+        "ステータス": status, "出場時間": minutes_text,
+        "対戦相手": game["away_short"] if side == "home" else game["home_short"],
+        "試合結果": f"{outcome} {scored}-{conceded}",
+        "ゴール数": str(ev.get("goal", 0)) if played else "",
+        "警告/退場": (f"{ev.get('yellow-card', 0)}/{ev.get('red-card', 0)}"
+                  if played else ""),
+        "備考": f"Jリーグ公式({U21})", "URL": game["url"],
+    }
+
+
+def u21_team_rows(club):
+    """指定したU-21クラブの最新試合を、メンバー全員分の行にする
+
+    試合がまだ無いシーズン序盤は空リストを返す(異常ではない)。
+    """
+    games = jl_u21_games(club["id"])
+    if not games:
+        log(f"{club['name']}: {CFG['year']}シーズンの{U21}に消化済みの試合がありません",
+            "WARN")
+        return []
+
+    latest = max(games, key=lambda g: g["date"])
+    side = u21_team_side(latest, club["name"])
+    if side is None:
+        raise ScrapeError(
+            f"{U21}の対戦カードに '{club['name']}' が見つからない",
+            f"u21_clubs.json のクラブ名を確認 "
+            f"({latest['home']} / {latest['away']})", latest["url"])
+
+    log(f"{club['name']} の最新試合: {latest['date']} {latest['home']} "
+        f"{latest['home_goals']}-{latest['away_goals']} {latest['away']}")
+    html = fetch(latest["url"])
+    save_html(html, f"u21_match_{latest['game_id']}")
+    plain = jl_unescape(html)
+
+    starters, members, subs, events = jl_match_members(html)
+    if not members:
+        raise ScrapeError(f"{U21}の試合ページからメンバー表を取得できない",
+                          "--save-html でHTMLを保存し構造を確認する", latest["url"])
+
+    team_key = jl_match_team_keys(plain).get(side)
+    if not team_key:
+        raise ScrapeError(f"{U21}の試合ページからチームの識別子を取得できない",
+                          "--save-html でHTMLを保存し構造を確認する", latest["url"])
+
+    rows = [u21_member_row(item, latest, side, club, starters, members, subs, events)
+            for item in u21_lineup_items(plain) if item["team_key"] == team_key]
+    if not rows:
+        raise ScrapeError(f"{U21}のメンバー表に {club['name']} の選手が1人もいない",
+                          f"チーム識別子 {team_key} の項目を確認", latest["url"])
+    debug(f"{club['name']}: メンバー{len(rows)}人を取得 (teamNameKey={team_key})")
+    return rows
+
+
+def u21_team_sheet_rows(clubs):
+    """対象クラブそれぞれの最新試合を集めて、U-21シート用の行にする
+
+    1クラブ失敗しても残りは出す。レンタル選手側の出力は止めない。
+    """
+    rows, errors = [], []
+    for club in clubs:
+        print(f"■ {club['name']} [{U21}]")
+        try:
+            rows.extend(u21_team_rows(club))
+        except ScrapeError as e:
+            log(e.summary(), "ERROR")
+            errors.append((club["name"], e.summary()))
+        except Exception as e:
+            log(f"想定外のエラー: {type(e).__name__}: {e}", "ERROR")
+            if CFG.get("debug"):
+                traceback.print_exc()
+            errors.append((club["name"], f"{type(e).__name__}: {e}"))
+    return rows, errors
 
 
 def minutes_to_entry(minutes):
@@ -3343,7 +3543,7 @@ def with_besoccer_rows(rows, player):
         extra = besoccer_blank_rows(player, f"{type(e).__name__}: {e}")
     for row in extra:
         # 日付が入っている行だけ重複判定する(試合なしの行は日付も試合も空)
-        if row["日付"] and any(r["日付"] == row["日付"] and r["試合"] == row["試合"]
+        if row["日付"] and any(r["日付"] == row["日付"] and r["対戦相手"] == row["対戦相手"]
                               for r in rows):
             debug(f"BeSoccerの{row['リーグ名']}は既存の行と同じなので追加しない")
             continue
@@ -3368,7 +3568,8 @@ def scrape_manual(player):
     if not latest:
         return blank(player, NO_MATCH, "manual だが latest が未設定")
     row = result(player, latest.get("ステータス", NO_MATCH),
-                 match=latest.get("試合", ""), date=latest.get("日付", ""),
+                 match=latest.get("対戦相手", latest.get("試合", "")),
+                 date=latest.get("日付", ""),
                  url=player.get("url", ""), note="手入力")
     row["出場時間"] = latest.get("出場時間", "")
     return row
@@ -3392,15 +3593,10 @@ def excel_display_width(value):
     return width
 
 
-def format_excel(path, team_latest_urls=None):
-    """team_latest_urls: {0始まりのデータ行番号: URL} — 「チーム最新試合日付」列の
-    日付セルにハイパーリンクを張るための対応表。"""
-    from openpyxl import load_workbook
+def style_sheet(ws):
+    """見出し・縞模様・列幅・固定行・フィルタを整える(シート共通)"""
     from openpyxl.styles import Alignment, Font, PatternFill
     from openpyxl.utils import get_column_letter
-
-    wb = load_workbook(path)
-    ws = wb.active
 
     header_fill = PatternFill("solid", fgColor="DDEBF7")
     even_row_fill = PatternFill("solid", fgColor="F7F7F7")
@@ -3425,7 +3621,26 @@ def format_excel(path, team_latest_urls=None):
             max_width = max(max_width, excel_display_width(cell.value))
         ws.column_dimensions[get_column_letter(col_idx)].width = min(max(max_width + 2, 10), 80)
 
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+
+
+def format_excel(path, team_latest_urls=None):
+    """team_latest_urls: {0始まりのデータ行番号: URL} — 「チーム最新試合日付」列の
+    日付セルにハイパーリンクを張るための対応表。
+
+    U-21シートを足したブックにも対応するため、全シートに書式を当てる。
+    ハイパーリンクはレンタル選手シートにしか無いので、そこだけに張る。
+    """
+    from openpyxl import load_workbook
+    from openpyxl.styles import Font
+
+    wb = load_workbook(path)
+    for ws in wb.worksheets:
+        style_sheet(ws)
+
     if team_latest_urls:
+        ws = wb[MAIN_SHEET] if MAIN_SHEET in wb.sheetnames else wb.worksheets[0]
         headers = [c.value for c in ws[1]]
         if "チーム最新試合日付" in headers:
             col_idx = headers.index("チーム最新試合日付") + 1
@@ -3436,8 +3651,6 @@ def format_excel(path, team_latest_urls=None):
                     cell.hyperlink = url
                     cell.font = link_font
 
-    ws.freeze_panes = "A2"
-    ws.auto_filter.ref = ws.dimensions
     wb.save(path)
 
 
@@ -3467,6 +3680,15 @@ def build_parser():
                     help="この日数以上前の試合は注意表示する(既定: 14)")
     ap.add_argument("--players-config", default=str(DEFAULT_PLAYERS_CONFIG),
                     help="選手設定JSONファイル(既定: players.json)")
+    ap.add_argument("--u21-club", nargs="+", default=None, dest="u21_club",
+                    metavar="CLUB",
+                    help="U-21シートの対象クラブ(IDまたはクラブ名。複数可。"
+                         "既定: u21_clubs.json の default)")
+    ap.add_argument("--no-u21-team", action="store_true", dest="no_u21_team",
+                    help="U-21 Ｊリーグのチーム単位シートを作らない")
+    ap.add_argument("--u21-clubs-config", default=str(u21_clubs.default_config_path()),
+                    dest="u21_clubs_config",
+                    help="U-21クラブ一覧ファイル(既定: u21_clubs.json)")
     ap.add_argument("--out", default="loan_players_latest", help="出力ファイル名(拡張子なし)")
     ap.add_argument("--no-excel", action="store_true", dest="no_excel",
                     help="Excelファイルを出力しない")
@@ -3474,6 +3696,25 @@ def build_parser():
                     help="CSVファイルを出力しない")
     ap.add_argument("--playwright-smoke-test", action="store_true", help=argparse.SUPPRESS)
     return ap
+
+
+def resolve_u21_clubs(args):
+    """--u21-club の指定を u21_clubs.json に照らして解決する
+
+    戻り値は (対象クラブのリスト, 解決できなかった指定のリスト)。
+    指定が無ければ設定ファイルの default を1件だけ対象にする。
+    """
+    if args.no_u21_team:
+        return [], []
+    clubs, default_id = u21_clubs.load_clubs(args.u21_clubs_config)
+    resolved, unknown = [], []
+    for token in (args.u21_club or [default_id]):
+        club = u21_clubs.find_club(clubs, token)
+        if club is None:
+            unknown.append(str(token))
+        elif club not in resolved:
+            resolved.append(club)
+    return resolved, unknown
 
 
 def main():
@@ -3548,6 +3789,13 @@ def main():
                     f"{r['出場時間']} ({r['日付']})")
             rows.append(r)
 
+    u21_clubs_wanted, u21_unknown = resolve_u21_clubs(args)
+    for token in u21_unknown:
+        log(f"U-21の対象クラブが見つかりません: {token} "
+            f"(u21_clubs.json の id かクラブ名で指定してください)", "WARN")
+    u21_rows, u21_errors = (u21_team_sheet_rows(u21_clubs_wanted)
+                            if u21_clubs_wanted else ([], []))
+
     # どのスクレイパ経由でも 経過 列が欠けないよう、日付から再計算する
     for r in rows:
         r["経過"] = format_elapsed(r.get("日付", ""))
@@ -3564,6 +3812,13 @@ def main():
     print(f" 最新試合の出場状況  (集計日: {date.today():%Y-%m-%d} / LoanWatch {APP_VERSION})")
     print("=" * 78)
     print(df.drop(columns=["URL"]).to_string(index=False))
+
+    u21_df = pd.DataFrame(u21_rows, columns=U21_COLUMNS) if u21_rows else None
+    if u21_df is not None:
+        print("\n" + "=" * 78)
+        print(f" {U21} 最新試合のメンバー  (シート: {U21_SHEET})")
+        print("=" * 78)
+        print(u21_df.drop(columns=["URL", "備考"]).to_string(index=False))
 
     # 日付が古い、あるいは日付が取れなかった選手を明示する
     stale, undated = [], []
@@ -3584,24 +3839,37 @@ def main():
     print(f"\n成功 {success}件 / 失敗 {len(errors)}件")
     for name, msg in errors:
         print(f"  - {name}: {msg}")
+    if u21_errors:
+        print(f"\n[注意] {U21}のチーム取得に失敗したクラブ:")
+        for name, msg in u21_errors:
+            print(f"  - {name}: {msg}")
 
     try:
         saved = []
         if not args.no_excel:
+            # U-21は列構成が違うので、同じブックの別シートに分ける
             xlsx_path = f"{args.out}.xlsx"
-            df.to_excel(xlsx_path, index=False)
+            with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
+                df.to_excel(writer, index=False, sheet_name=MAIN_SHEET)
+                if u21_df is not None:
+                    u21_df.to_excel(writer, index=False, sheet_name=U21_SHEET)
             format_excel(xlsx_path, team_latest_urls)
             saved.append(xlsx_path)
         if not args.no_csv:
+            # CSVはシートを持てないため、U-21は別ファイルにする
             csv_path = f"{args.out}.csv"
             df.to_csv(csv_path, index=False, encoding="utf-8-sig")
             saved.append(csv_path)
+            if u21_df is not None:
+                u21_csv_path = f"{args.out}_u21.csv"
+                u21_df.to_csv(u21_csv_path, index=False, encoding="utf-8-sig")
+                saved.append(u21_csv_path)
         print(" / ".join(saved) + " に保存しました")
     except Exception as e:
         print(f"ファイル保存に失敗: {type(e).__name__}: {e}", file=sys.stderr)
         return 1
 
-    return 1 if errors else 0
+    return 1 if errors or u21_errors else 0
 
 
 if __name__ == "__main__":

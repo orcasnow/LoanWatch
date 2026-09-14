@@ -16,6 +16,7 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import messagebox, ttk
 
+import u21_clubs
 from version import APP_VERSION
 
 
@@ -44,6 +45,19 @@ def season_choices():
     return season_choices_for(date.today())
 
 
+U21_NONE_LABEL = "取得しない"
+
+
+def u21_choices():
+    """U-21プルダウンの (表示名, クラブID) 一覧。先頭は「取得しない」"""
+    clubs, default_id = u21_clubs.load_clubs()
+    choices = [(U21_NONE_LABEL, "")]
+    choices += [(c["name"], c["id"]) for c in clubs]
+    default_label = next((c["name"] for c in clubs if c["id"] == default_id),
+                         U21_NONE_LABEL)
+    return choices, default_label
+
+
 def default_output_name():
     return f"loan_players_{date.today():%Y-%m-%d}"
 
@@ -61,7 +75,11 @@ class LoanWatchGui(tk.Tk):
         self.process = None
         self.worker = None
 
+        self.u21_options, u21_default = u21_choices()
+        self.u21_label_to_id = {label: value for label, value in self.u21_options}
+
         self.season_var = tk.StringVar(self, value=self.seasons[0][0])
+        self.u21_var = tk.StringVar(self, value=u21_default)
         self.excel_var = tk.BooleanVar(self, value=True)
         self.csv_var = tk.BooleanVar(self, value=True)
         self.out_var = tk.StringVar(self, value=default_output_name())
@@ -96,8 +114,24 @@ class LoanWatchGui(tk.Tk):
             row=0, column=3, sticky="ew", pady=4
         )
 
+        ttk.Label(controls, text="U-21 対象クラブ").grid(
+            row=1, column=0, sticky="w", padx=(0, 6)
+        )
+        self.u21_combo = ttk.Combobox(
+            controls,
+            textvariable=self.u21_var,
+            values=[label for label, _value in self.u21_options],
+            state="readonly",
+            width=22,
+        )
+        self.u21_combo.grid(row=1, column=1, sticky="w", pady=4)
+        ttk.Label(
+            controls,
+            text="選んだクラブの最新試合のメンバーを、別シート「U-21最新試合」に出します",
+        ).grid(row=1, column=2, columnspan=2, sticky="w", padx=(18, 0))
+
         output_frame = ttk.Frame(controls)
-        output_frame.grid(row=1, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        output_frame.grid(row=2, column=0, columnspan=4, sticky="w", pady=(8, 0))
         ttk.Label(output_frame, text="出力形式").grid(row=0, column=0, sticky="w", padx=(0, 8))
         ttk.Checkbutton(output_frame, text="Excel", variable=self.excel_var).grid(
             row=0, column=1, sticky="w", padx=(0, 10)
@@ -107,7 +141,7 @@ class LoanWatchGui(tk.Tk):
         )
 
         actions = ttk.Frame(controls)
-        actions.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(12, 0))
+        actions.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(12, 0))
         actions.columnconfigure(4, weight=1)
 
         self.run_button = ttk.Button(actions, text="実行", command=self.run_loanwatch_checked)
@@ -158,6 +192,8 @@ class LoanWatchGui(tk.Tk):
             cmd.append("--no-excel")
         if not self.csv_var.get():
             cmd.append("--no-csv")
+        u21_id = self.u21_label_to_id.get(self.u21_var.get(), "")
+        cmd += ["--u21-club", u21_id] if u21_id else ["--no-u21-team"]
         return cmd
 
     def run_loanwatch(self):
