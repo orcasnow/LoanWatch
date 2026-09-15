@@ -8,3 +8,5 @@ dist/
 .build-venv/
 LoanWatch.exe
 cache/
+u21_history.db
+u21_history_*.db

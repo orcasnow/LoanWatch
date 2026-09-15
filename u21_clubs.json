@@ -1,6 +1,19 @@
 {
-  "_comment": "U-21 Ｊリーグのクラブ一覧。id は日程検索ページ /u-21/match/search-list/ の &club= の値。default に書いたクラブが既定の取得対象になる。",
+  "_comment": "U-21 Ｊリーグの取得設定。id は日程検索ページの &club= の値。default に書いたクラブが既定の取得対象になる。",
   "default": "33186",
+
+  "_comment_season": "シーズンの開幕月。日程検索の開始日(この月の1日)に使う。開幕が早まったらここを変える。",
+  "season_start_month": 8,
+
+  "_comment_schedules": "試合日程の取得元。順位決定戦などが別大会・別URLになった場合は、ここに2件目を足せば同じ台帳へ取り込まれる。url の {start}{end}{club} は実行時に置き換わる。path は試合ページURLの /match/<ここ>/ の部分。",
+  "schedules": [
+    {
+      "name": "U-21 Ｊリーグ",
+      "path": "u-21",
+      "url": "https://www.jleague.jp/u-21/match/search-list/?startdate={start}&enddate={end}&period=custom&club={club}"
+    }
+  ],
+
   "clubs": [
     { "id": "33180", "name": "U-21 浦和レッズ",        "group": "EAST" },
     { "id": "33181", "name": "U-21 ＦＣ東京",          "group": "EAST" },

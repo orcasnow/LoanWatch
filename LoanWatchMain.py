@@ -25,10 +25,17 @@ GUI版:
     python LoanWatchGui.py            # 実行設定・ログ画面＋「選手設定を編集」ボタン
     python PlayersEditor.py           # players.json 編集画面を単体起動
 
-U-21 Ｊリーグ(チーム単位):
-    レンタル選手とは別に、指定したU-21クラブの最新試合のメンバー全員を
-    Excelの別シート「U-21最新試合」へ出力する。対象クラブは u21_clubs.json で
-    管理し、GUIのプルダウンまたは --u21-club で選ぶ(既定は名古屋グランパス)。
+U-21 Ｊリーグ(チーム単位・台帳方式):
+    レンタル選手とは別に、指定したU-21クラブの出場記録を積み上げ、選手ごとに
+    1行でExcelの別シート「U-21最新試合」へ出力する。行は
+      ・すでに台帳にある選手が次の試合に関与 → その行を最新の内容で上書き
+      ・台帳に無い選手                      → 行を追記
+      ・その試合に関与しなかった選手        → 前回までの内容のまま残す
+    という動き方をする。台帳は u21_history.db(SQLite)に貯め、実行のたびに
+    未取得の試合だけを取りに行く。実行間隔を空けても、その間の試合はまとめて
+    反映される。
+    対象クラブ・開幕月・日程の取得元は u21_clubs.json で管理し、クラブは
+    GUIのプルダウンまたは --u21-club で選ぶ(既定は名古屋グランパス)。
     メンバー表に載らないベンチ外の選手は、この方式では出力されない。
 
 出力列:
@@ -46,6 +53,7 @@ import argparse
 import asyncio
 import os
 import re
+import sqlite3
 import sys
 import time
 import traceback
@@ -103,6 +111,10 @@ def app_dir():
 # =========================================================
 STARTER, SUBBED_IN, BENCH, OUT_SQUAD, NO_MATCH = \
     "先発", "途中出場", "ベンチ入りのみ", "ベンチ外", "試合なし"
+
+# 出場時間の計算に使う試合の長さ。アディショナルタイムは扱わない
+# (Jリーグ公式の出場時間も同じ数え方)。
+FULL_MATCH_MINUTES, HALF_MINUTES = 90, 45
 
 # 行テキストから状態を判定するためのキーワード
 KW_BENCH     = ["ベンチ入り", "ベンチ", "控え", "出場なし", "未出場"]
@@ -1840,6 +1852,8 @@ JL_CLUB_URL = "https://www.jleague.jp/club/{slug}/"
 RE_JL_CLUB_SLUG = re.compile(r'clubId\\*"\s*:\s*\\*"([A-Za-z0-9_-]+)\\*"')
 RE_JL_PLAYER_ID = re.compile(r"/player/(\d+)")
 RE_JL_ALL_MEMBERS = re.compile(r'"allMemberIds"\s*:\s*(\[[^\]]*\])')
+# 交代イベントの時刻。"46*’" の * はハーフタイム等の区切りでの交代を表す
+RE_JL_EVENT_TIME = re.compile(r"(\d+)\s*(\*?)")
 # "m-lineup-list-item" と "subs" の間には "ref" のほかに属性が入ることがある。
 #   通常          ..."m-lineup-list-item","ref":"$undefined","subs":[...]
 #   警告を受けた選手 ..."m-lineup-list-item","ref":"$undefined","card":"yellow","subs":[...]
@@ -1965,32 +1979,70 @@ def jl_match_members(html):
     return starters, members, subs, events
 
 
+def jl_event_minute(time_text):
+    """交代イベントの時刻表記を分に直す
+
+    "70’" は70分。"46*’" の * はハーフタイムなど区切りでの交代を表し、
+    Jリーグ公式はこれを45分として数える(46*→45、延長の 106*→105 も同じ)。
+    """
+    m = RE_JL_EVENT_TIME.search(str(time_text))
+    if not m:
+        return None
+    minute = int(m.group(1))
+    return minute - 1 if m.group(2) else minute
+
+
+def jl_entry_label(entry):
+    """出場した時刻を "後半25分" のような表記にする"""
+    if entry is None:
+        return ""
+    if entry <= 0:
+        return "開始"
+    if entry < HALF_MINUTES:
+        return f"前半{entry}分"
+    if entry == HALF_MINUTES:
+        return "後半開始"
+    return f"後半{entry - HALF_MINUTES}分"
+
+
 def jl_member_status(player_id, starters, members, subs):
-    """メンバー表から、その選手の出場区分と出場時間の表示を決める
+    """メンバー表から (出場区分, 出場時間の表示, 出場分数) を決める
 
     メンバー表(allMemberIds)に名前が無ければベンチ外と判定できる。
-    出場履歴しか見ない大会(U-21 Ｊリーグ)との精度の差はここから来る。
+    出場履歴しか見ない大会との精度の差はここから来る。
+
+    分数はJリーグ公式の出場時間と一致する数え方にしている。
+      先発     … 交代で退いた分。退いていなければ90(フル出場)
+      途中出場 … (退いた分 または 90) − 入った分
+    途中出場の選手がさらに交代で退くことがあるため、in だけでなく out も見る。
+    見ていないと、その選手だけ試合終了まで出場した扱いになる。
     """
     events = subs.get(player_id) or []
 
     def minute(kind):
         for e in events:
             if e.get("type") == kind:
-                m = re.search(r"(\d+)", str(e.get("time", "")))
-                return int(m.group(1)) if m else None
+                return jl_event_minute(e.get("time", ""))
         return None
 
     if player_id in starters:
         out = minute("out")
-        return STARTER, (f"先発〜{out}分で交代({out}分)" if out else "フル出場")
+        if not out:
+            return STARTER, "フル出場", FULL_MATCH_MINUTES
+        return STARTER, f"先発〜{out}分で交代({out}分)", out
     if player_id in members:
         entry = minute("in")
         if entry is None:
-            return BENCH, ""
-        minutes = max(90 - entry, 0)
-        _, label = minutes_to_entry(minutes)
-        return SUBBED_IN, (f"{label}から出場(約{minutes}分)" if label else f"約{minutes}分")
-    return OUT_SQUAD, ""
+            return BENCH, "", 0
+        out = minute("out")
+        minutes = max((out or FULL_MATCH_MINUTES) - entry, 0)
+        label = jl_entry_label(entry)
+        if not label:
+            return SUBBED_IN, f"{minutes}分", minutes
+        if out:
+            return SUBBED_IN, f"{label}〜{out}分で交代({minutes}分)", minutes
+        return SUBBED_IN, f"{label}から出場({minutes}分)", minutes
+    return OUT_SQUAD, "", 0
 
 
 def jl_cup_row(player, season_start, league, path):
@@ -2026,7 +2078,8 @@ def jl_cup_row(player, season_start, league, path):
         raise ScrapeError(f"{league}の試合ページからメンバー表を取得できない",
                           "--save-html でHTMLを保存し構造を確認する", match_url)
 
-    status, minutes_text = jl_member_status(player_id, starters, members, subs)
+    status, minutes_text, _minutes = jl_member_status(
+        player_id, starters, members, subs)
     played = status in (STARTER, SUBBED_IN)
     ev = events.get(player_id) or {}
     row = result(player, status, match=latest["opponent"],
@@ -2076,64 +2129,96 @@ def jl_levain_cup_row(player, season_start):
 # 試合IDは href の 6桁(月日+連番)。日付もここから決まる。
 # =========================================================
 U21 = "U-21 Ｊリーグ"
-U21_SEARCH_URL = ("https://www.jleague.jp/u-21/match/search-list/"
-                  "?startdate={start}&enddate={end}&period=custom&club={club}")
-# U-21 Ｊリーグの開幕月。日程検索の開始日に使う(2026年は8月末に開幕)
-U21_OPENING_MONTH = 8
-RE_U21_MATCH_HREF = re.compile(r"/match/u-21/(\d{4})/(\d{6})/")
+# 日程の取得元・開幕月は u21_clubs.json で変えられる(順位決定戦が別大会・
+# 別URLになった場合に、設定を足すだけで同じ台帳へ取り込めるようにするため)。
+_U21_CONFIG = {}
 # {(開始日, 終了日, クラブID): 試合リスト} — 同じクラブの選手で使い回す
 _JL_U21_CACHE = {}
 
 
-def jl_u21_games(club_id):
-    """U-21 Ｊリーグの、そのクラブの今季の消化済み試合を返す
+def u21_config():
+    """u21_clubs.json の内容を返す(1回の実行中は読み直さない)"""
+    if not _U21_CONFIG:
+        _U21_CONFIG.update(u21_clubs.load_config(CFG.get("u21_clubs_config")))
+    return _U21_CONFIG
 
-    U-21 Ｊリーグは8月開幕なので、検索期間は今季の8月1日から当日まで。
-    Football-LAB から得る season_start はレポートページに出ている範囲までしか
-    遡らないため、それを開始日にすると開幕直後の試合を取りこぼすことがある。
+
+def u21_season_start():
+    """今季の日程検索の開始日。開幕月の1日"""
+    return date(CFG["year"], u21_config()["season_start_month"], 1)
+
+
+def u21_match_href_re(path):
+    """試合ページURL(/match/<path>/<年>/<月日連番>/)を拾う正規表現"""
+    return re.compile(rf"/match/{re.escape(path)}/(\d{{4}})/(\d{{6}})/")
+
+
+def jl_u21_games(club_id):
+    """U-21 Ｊリーグの、そのクラブの今季の消化済み試合を返す(日付の古い順)
+
+    検索期間は開幕月の1日から当日まで。Football-LAB から得る season_start は
+    レポートページに出ている範囲までしか遡らないため、それを開始日にすると
+    開幕直後の試合を取りこぼすことがある。
+    終了日を当日にしているので、シーズンが年をまたいでも(2026-27は2027年3月
+    まで)そのまま拾える。
     """
-    opening = date(CFG["year"], U21_OPENING_MONTH, 1)
+    opening = u21_season_start()
     today = date.today()
     if today < opening:
-        debug(f"{U21}は{CFG['year']}年{U21_OPENING_MONTH}月開幕のためまだ試合が無い")
+        debug(f"{U21}は{opening.year}年{opening.month}月開幕のためまだ試合が無い")
         return []
     start, end = opening.strftime("%Y-%m-%d"), today.strftime("%Y-%m-%d")
     key = (start, end, club_id)
     if key in _JL_U21_CACHE:
         return _JL_U21_CACHE[key]
 
-    url = U21_SEARCH_URL.format(start=start, end=end, club=club_id)
-    html = fetch(url)
-    games = jl_u21_parse_games(html, url)
-    # 遅延配信で中身が届いていない試合があれば、ブラウザで取り直す
-    linked = {m[1] for m in RE_U21_MATCH_HREF.findall(html)}
-    if len(games) < len(linked):
-        debug(f"{U21}の日程: リンク{len(linked)}件に対しパースできたのは{len(games)}件。"
-              f"ブラウザで取り直します")
-        try:
-            html = render(url, wait_selector="div.m-schedule__wrapper",
-                          locale="ja-JP", scroll=True)
-            games = jl_u21_parse_games(html, url)
-        except ScrapeError as e:
-            log(f"{U21}の日程をブラウザで取得できません({e.message})。"
-                f"一部の試合が欠けたまま判定します", "WARN")
-    save_html(html, f"u21_search_{club_id}")
+    # 同じ試合が複数の取得元に出ても、試合IDで1件にまとまる
+    found = {}
+    for schedule in u21_config()["schedules"]:
+        for game in jl_u21_schedule_games(schedule, club_id, start, end):
+            found.setdefault(game["game_id"], game)
+    games = sorted(found.values(), key=lambda g: (g["date"], g["game_id"]))
     debug(f"{U21}の日程({start}〜{end} club={club_id}): 消化済み{len(games)}試合")
     _JL_U21_CACHE[key] = games
     return games
 
 
-def jl_u21_parse_games(html, base_url):
+def jl_u21_schedule_games(schedule, club_id, start, end):
+    """取得元1件ぶんの日程を読む。失敗しても他の取得元を止めない"""
+    url = schedule["url"].format(start=start, end=end, club=club_id)
+    href_re = u21_match_href_re(schedule["path"])
+    try:
+        html = fetch(url)
+    except ScrapeError as e:
+        log(f"{schedule['name']}の日程を取得できません({e.message})", "WARN")
+        return []
+    games = jl_u21_parse_games(html, url, href_re)
+    # 遅延配信で中身が届いていない試合があれば、ブラウザで取り直す
+    linked = {m[1] for m in href_re.findall(html)}
+    if len(games) < len(linked):
+        debug(f"{schedule['name']}の日程: リンク{len(linked)}件に対し"
+              f"パースできたのは{len(games)}件。ブラウザで取り直します")
+        try:
+            html = render(url, wait_selector="div.m-schedule__wrapper",
+                          locale="ja-JP", scroll=True)
+            games = jl_u21_parse_games(html, url, href_re)
+        except ScrapeError as e:
+            log(f"{schedule['name']}の日程をブラウザで取得できません({e.message})。"
+                f"一部の試合が欠けたまま判定します", "WARN")
+    save_html(html, f"u21_search_{schedule['path']}_{club_id}")
+    return games
+
+
+def jl_u21_parse_games(html, base_url, href_re):
     """日程検索ページから、結果の出ている試合だけを取り出す"""
     soup = BeautifulSoup(html, "lxml")
     games = []
     for card in soup.select("div.m-schedule__wrapper"):
-        link = card.select_one("a[href*='/match/u-21/']")
+        link = next((a for a in card.select("a[href]")
+                     if href_re.search(a["href"])), None)
         if link is None:
             continue
-        m = RE_U21_MATCH_HREF.search(link["href"])
-        if not m:
-            continue
+        m = href_re.search(link["href"])
         year, tail = m.group(1), m.group(2)
         try:
             when = date(int(year), int(tail[:2]), int(tail[2:4]))
@@ -2199,7 +2284,8 @@ def jl_u21_cup_row(player, season_start):
         raise ScrapeError(f"{U21}の試合ページからメンバー表を取得できない",
                           "--save-html でHTMLを保存し構造を確認する", latest["url"])
 
-    status, minutes_text = jl_member_status(player_id, starters, members, subs)
+    status, minutes_text, _minutes = jl_member_status(
+        player_id, starters, members, subs)
     played = status in (STARTER, SUBBED_IN)
     ev = events.get(player_id) or {}
     scored, conceded = ((latest["home_goals"], latest["away_goals"]) if is_home
@@ -2218,17 +2304,24 @@ def jl_u21_cup_row(player, season_start):
 
 
 # =========================================================
-# U-21 Ｊリーグ チーム単位 (指定クラブの最新試合、メンバー表の全員)
+# U-21 Ｊリーグ チーム単位 (台帳方式)
 #
-# レンタル選手の追跡(選手 → 大会)とは向きが逆で、クラブ → 最新試合 →
+# レンタル選手の追跡(選手 → 大会)とは向きが逆で、クラブ → 試合 →
 # メンバー全員 の順にたどる。players.json への選手登録は不要。
 #
-#   ① 日程検索 (club=<id>) から今季の消化済み試合 → 最新の1試合
-#   ② その試合ページのメンバー表を、そのクラブの選手だけ全員分ひらく
+#   ① 日程検索(club指定)から今季の消化済み試合の一覧を得る
+#   ② 台帳(SQLite)に未記録の試合だけ、試合ページを取りに行く
+#   ③ メンバー表の全員を「1試合1選手1レコード」で台帳へ記録する
+#   ④ 台帳から、選手ごとの最新1試合＋今季の通算を組み立ててシートにする
 #
-# 日程検索は必ず club を指定する。指定せずに取るとReactの遅延配信で
-# 試合カードの中身が届かず、静かに数試合欠ける(実測でリンク10件に対し
-# パースできたのは6件)。クラブを絞れば件数が少ないため欠落しない。
+# ②の差分取得により、実行間隔に左右されない。2週間空けても、その間の全試合が
+# まとめて反映される。順位決定戦などが後から日程に足されても、台帳に無い
+# 試合IDとして現れるだけなので自動的に取り込まれる。
+# 台帳はJリーグ公式から再生成できる(全試合を取り直せば同じ内容になる)ため、
+# 壊れても失うのは取得の手間だけ。
+#
+# 日程は先に全部公開され、結果が付いた試合だけが「消化済み」になる。試合当日は
+# 内容が後から補正されることがあるので、新しい方から数試合は毎回取り直す。
 #
 # 試合ページはRSCのストリーミング参照で書かれているが、参照先の実体も
 # 同じHTML内にあるため requests だけで全員分取れる。控え1人分の実体:
@@ -2241,9 +2334,15 @@ def jl_u21_cup_row(player, season_start):
 # =========================================================
 MAIN_SHEET = "レンタル選手"
 U21_SHEET = "U-21最新試合"
-U21_COLUMNS = ["背番号", "ポジション", "選手", "クラブ", "リーグ名", "日付", "経過",
-               "ステータス", "出場時間", "対戦相手", "試合結果", "ゴール数",
-               "警告/退場", "備考", "URL"]
+U21_COLUMNS = ["背番号", "ポジション", "選手", "クラブ", "リーグ名",
+               "最新試合関与試合", "経過", "ステータス", "出場時間",
+               "対戦相手", "試合結果", "ゴール数", "警告/退場",
+               "メンバー入り", "先発", "途中出場", "ベンチ入りのみ",
+               "通算出場時間(分)", "備考", "URL"]
+# 出力の並び順。名鑑と同じ GK→DF→MF→FW、その中は背番号順
+U21_POS_ORDER = {"GK": 0, "DF": 1, "MF": 2, "FW": 3}
+# 新しい方からこの数だけは毎回取り直す(試合当日の内容が後から補正されるため)
+U21_REFETCH_RECENT = 2
 
 # メンバー1人分のかたまりは '"memberId":"<選手ID>"' で始まる。そこで区切って
 # から中を読むので、ある選手の項目を隣の選手の項目と取り違える余地がない。
@@ -2278,10 +2377,7 @@ def jl_match_team_keys(plain):
 
 
 def u21_lineup_items(plain):
-    """メンバー表を [{id, team_key, pos, no, name}] にする(表示順のまま)
-
-    表示順は 先発(GK→DF→MF→FW) → 控え なので、並べ替えずにそのまま使う。
-    """
+    """メンバー表を [{id, team_key, pos, no, name}] にする(表示順のまま)"""
     items, seen = [], set()
     for part in plain.split('"memberId":"')[1:]:
         m = RE_U21_ITEM_ID.match(part)
@@ -2318,77 +2414,273 @@ def u21_team_side(game, club_name):
     return None
 
 
-def u21_member_row(item, game, side, club, starters, members, subs, events):
-    """メンバー表の1人をExcelの1行にする"""
-    status, minutes_text = jl_member_status(item["id"], starters, members, subs)
-    played = status in (STARTER, SUBBED_IN)
-    ev = events.get(item["id"]) or {}
+def u21_result_text(game, side):
+    """対象クラブ視点の '勝 3-1' を作る"""
     scored, conceded = ((game["home_goals"], game["away_goals"]) if side == "home"
                         else (game["away_goals"], game["home_goals"]))
     outcome = "勝" if scored > conceded else "負" if scored < conceded else "分"
-    when = game["date"].strftime("%Y-%m-%d")
-    return {
-        # 背番号はExcelで並べ替えられるよう数値のまま入れる
-        "背番号": int(item["no"]) if item["no"].isdigit() else item["no"],
-        "ポジション": item["pos"], "選手": item["name"],
-        "クラブ": club["name"], "リーグ名": U21,
-        "日付": when, "経過": format_elapsed(when),
-        "ステータス": status, "出場時間": minutes_text,
-        "対戦相手": game["away_short"] if side == "home" else game["home_short"],
-        "試合結果": f"{outcome} {scored}-{conceded}",
-        "ゴール数": str(ev.get("goal", 0)) if played else "",
-        "警告/退場": (f"{ev.get('yellow-card', 0)}/{ev.get('red-card', 0)}"
-                  if played else ""),
-        "備考": f"Jリーグ公式({U21})", "URL": game["url"],
-    }
+    return f"{outcome} {scored}-{conceded}"
 
 
-def u21_team_rows(club):
-    """指定したU-21クラブの最新試合を、メンバー全員分の行にする
+# ---------------------------------------------------------
+# 台帳 (SQLite)
+#
+# 置き場所は exe と同じフォルダ。Dropboxフォルダで動かすため WAL は使わない
+# (-wal / -shm が別ファイルとして同期され、DBが壊れることがある)。既定の
+# journal_mode のまま、処理の間だけ開いて閉じる。
+# ---------------------------------------------------------
+U21_DB_NAME = "u21_history.db"
+U21_DB_VERSION = 1
+U21_DB_SCHEMA = """
+CREATE TABLE IF NOT EXISTS game(
+  season INTEGER NOT NULL, club_id TEXT NOT NULL, game_id TEXT NOT NULL,
+  date TEXT NOT NULL,
+  side TEXT NOT NULL,
+  opponent TEXT NOT NULL, result TEXT NOT NULL,
+  url TEXT NOT NULL, fetched_at TEXT NOT NULL,
+  PRIMARY KEY(season, club_id, game_id));
 
-    試合がまだ無いシーズン序盤は空リストを返す(異常ではない)。
+CREATE TABLE IF NOT EXISTS appearance(
+  season INTEGER NOT NULL, club_id TEXT NOT NULL, game_id TEXT NOT NULL,
+  player_id TEXT NOT NULL,
+  name TEXT NOT NULL, no TEXT, pos TEXT,
+  status TEXT NOT NULL,
+  minutes_text TEXT, minutes INTEGER NOT NULL DEFAULT 0,
+  goals INTEGER NOT NULL DEFAULT 0,
+  yellow INTEGER NOT NULL DEFAULT 0, red INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(season, club_id, game_id, player_id));
+
+CREATE INDEX IF NOT EXISTS idx_app_player
+  ON appearance(season, club_id, player_id, game_id);
+"""
+
+
+def u21_db_path():
+    return app_dir() / U21_DB_NAME
+
+
+def u21_db_open(path):
+    """台帳を開いて、必要なら表を作る
+
+    途中で失敗したら必ず閉じる。開いたままにすると、Windowsでは呼び出し側が
+    壊れたファイルを退避しようとしても「使用中」で動かせなくなる。
     """
-    games = jl_u21_games(club["id"])
-    if not games:
-        log(f"{club['name']}: {CFG['year']}シーズンの{U21}に消化済みの試合がありません",
-            "WARN")
-        return []
+    con = sqlite3.connect(path)
+    try:
+        con.row_factory = sqlite3.Row
+        con.execute("PRAGMA journal_mode=DELETE")
+        version = con.execute("PRAGMA user_version").fetchone()[0]
+        if version > U21_DB_VERSION:
+            raise ScrapeError(
+                f"U-21台帳が新しい形式です(台帳 v{version} / このアプリ v{U21_DB_VERSION})",
+                "LoanWatch を新しい版に更新してください", str(path))
+        con.executescript(U21_DB_SCHEMA)
+        con.execute(f"PRAGMA user_version={U21_DB_VERSION}")
+        con.commit()
+    except BaseException:
+        con.close()
+        raise
+    return con
 
-    latest = max(games, key=lambda g: g["date"])
-    side = u21_team_side(latest, club["name"])
-    if side is None:
-        raise ScrapeError(
-            f"{U21}の対戦カードに '{club['name']}' が見つからない",
-            f"u21_clubs.json のクラブ名を確認 "
-            f"({latest['home']} / {latest['away']})", latest["url"])
 
-    log(f"{club['name']} の最新試合: {latest['date']} {latest['home']} "
-        f"{latest['home_goals']}-{latest['away_goals']} {latest['away']}")
-    html = fetch(latest["url"])
-    save_html(html, f"u21_match_{latest['game_id']}")
-    plain = jl_unescape(html)
+def u21_db_connect():
+    """台帳を開く。壊れていたら退避して作り直す
 
+    台帳はJリーグ公式から再生成できるので、壊れた場合に失うのは取得の手間だけ。
+    退避したファイルは消さずに残す(中身を見たいときのため)。
+    """
+    path = u21_db_path()
+    try:
+        return u21_db_open(path)
+    except sqlite3.DatabaseError as e:
+        broken = path.with_name(f"{path.stem}_破損_{datetime.now():%Y%m%d_%H%M%S}.db")
+        log(f"U-21台帳を開けません({type(e).__name__}: {e}) → "
+            f"{broken.name} へ退避して作り直します", "WARN")
+        try:
+            path.replace(broken)
+        except OSError as move_error:
+            raise ScrapeError("U-21台帳を退避できない",
+                              f"{path} を手で削除してください", str(move_error))
+        return u21_db_open(path)
+
+
+def u21_db_recorded_games(con, season, club_id):
+    """台帳に入っている試合IDの集合"""
+    rows = con.execute(
+        "SELECT game_id FROM game WHERE season=? AND club_id=?",
+        (season, club_id)).fetchall()
+    return {r["game_id"] for r in rows}
+
+
+def u21_db_save_game(con, season, club_id, game, side, records):
+    """1試合ぶんを台帳へ書く(取り直しのときは同じ試合の記録を入れ替える)"""
+    with con:  # 例外が出れば丸ごと巻き戻る
+        con.execute("DELETE FROM appearance WHERE season=? AND club_id=? AND game_id=?",
+                    (season, club_id, game["game_id"]))
+        con.execute(
+            "INSERT OR REPLACE INTO game"
+            "(season, club_id, game_id, date, side, opponent, result, url, fetched_at)"
+            " VALUES(?,?,?,?,?,?,?,?,?)",
+            (season, club_id, game["game_id"], game["date"].strftime("%Y-%m-%d"),
+             side, game["away_short"] if side == "home" else game["home_short"],
+             u21_result_text(game, side), game["url"],
+             datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+        con.executemany(
+            "INSERT INTO appearance"
+            "(season, club_id, game_id, player_id, name, no, pos,"
+            " status, minutes_text, minutes, goals, yellow, red)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            [(season, club_id, game["game_id"], r["player_id"], r["name"],
+              r["no"], r["pos"], r["status"], r["minutes_text"], r["minutes"],
+              r["goals"], r["yellow"], r["red"]) for r in records])
+
+
+def u21_db_appearances(con, season, club_id):
+    """その季・そのクラブの出場記録を、日付の古い順で返す"""
+    return con.execute(
+        "SELECT a.*, g.date, g.opponent, g.result, g.url"
+        "  FROM appearance a"
+        "  JOIN game g ON g.season=a.season AND g.club_id=a.club_id"
+        "             AND g.game_id=a.game_id"
+        " WHERE a.season=? AND a.club_id=?"
+        " ORDER BY g.date, a.game_id",
+        (season, club_id)).fetchall()
+
+
+def u21_match_records(html, plain, game, side):
+    """試合ページから、対象クラブのメンバー全員ぶんの記録を作る"""
     starters, members, subs, events = jl_match_members(html)
     if not members:
         raise ScrapeError(f"{U21}の試合ページからメンバー表を取得できない",
-                          "--save-html でHTMLを保存し構造を確認する", latest["url"])
-
+                          "--save-html でHTMLを保存し構造を確認する", game["url"])
     team_key = jl_match_team_keys(plain).get(side)
     if not team_key:
         raise ScrapeError(f"{U21}の試合ページからチームの識別子を取得できない",
-                          "--save-html でHTMLを保存し構造を確認する", latest["url"])
+                          "--save-html でHTMLを保存し構造を確認する", game["url"])
 
-    rows = [u21_member_row(item, latest, side, club, starters, members, subs, events)
-            for item in u21_lineup_items(plain) if item["team_key"] == team_key]
+    records = []
+    for item in u21_lineup_items(plain):
+        if item["team_key"] != team_key:
+            continue
+        status, minutes_text, minutes = jl_member_status(
+            item["id"], starters, members, subs)
+        ev = events.get(item["id"]) or {}
+        records.append({
+            "player_id": item["id"], "name": item["name"],
+            "no": item["no"], "pos": item["pos"],
+            "status": status, "minutes_text": minutes_text, "minutes": minutes,
+            "goals": ev.get("goal", 0),
+            "yellow": ev.get("yellow-card", 0), "red": ev.get("red-card", 0),
+        })
+    if not records:
+        raise ScrapeError(f"{U21}のメンバー表に対象クラブの選手が1人もいない",
+                          f"チーム識別子 {team_key} の項目を確認", game["url"])
+    return records
+
+
+def u21_collect_games(con, season, club, games):
+    """未記録の試合と、新しい方の数試合を取り直して台帳へ入れる
+
+    1試合の取得に失敗しても台帳に入れない(入れると以後ずっと欠けたままになる)。
+    戻り値は (取り込んだ試合数, 失敗した試合のリスト)。
+    """
+    recorded = u21_db_recorded_games(con, season, club["id"])
+    recent = {g["game_id"] for g in games[-U21_REFETCH_RECENT:]}
+    todo = [g for g in games if g["game_id"] not in recorded or g["game_id"] in recent]
+    if not todo:
+        debug(f"{club['name']}: 台帳は最新です(記録済み{len(recorded)}試合)")
+        return 0, []
+
+    log(f"{club['name']}: 台帳に{len(recorded)}試合 / 今回取得する試合 {len(todo)}件")
+    done, failed = 0, []
+    for game in todo:
+        side = u21_team_side(game, club["name"])
+        if side is None:
+            failed.append((game, f"対戦カードに '{club['name']}' が無い"
+                                 f"({game['home']} / {game['away']})"))
+            continue
+        try:
+            html = fetch(game["url"])
+            save_html(html, f"u21_match_{game['game_id']}")
+            records = u21_match_records(html, jl_unescape(html), game, side)
+            u21_db_save_game(con, season, club["id"], game, side, records)
+        except ScrapeError as e:
+            failed.append((game, e.summary()))
+            continue
+        except Exception as e:
+            failed.append((game, f"{type(e).__name__}: {e}"))
+            continue
+        done += 1
+        log(f"  {game['date']} {game['home']} "
+            f"{game['home_goals']}-{game['away_goals']} {game['away']}"
+            f" → メンバー{len(records)}人")
+    for game, reason in failed:
+        log(f"{club['name']}: {game['date']} の試合を取り込めません({reason})", "WARN")
+    return done, failed
+
+
+def u21_ledger_rows(con, season, club):
+    """台帳から、選手ごとに1行(最新の関与試合＋今季の通算)を作る"""
+    per_player = {}
+    for rec in u21_db_appearances(con, season, club["id"]):
+        acc = per_player.setdefault(rec["player_id"], {
+            "メンバー入り": 0, "先発": 0, "途中出場": 0, "ベンチ入りのみ": 0,
+            "通算出場時間(分)": 0})
+        acc["メンバー入り"] += 1
+        if rec["status"] in acc:
+            acc[rec["status"]] += 1
+        acc["通算出場時間(分)"] += rec["minutes"] or 0
+        acc["latest"] = rec  # 日付の古い順なので、最後に入ったものが最新
+
+    rows = []
+    for acc in per_player.values():
+        rec = acc["latest"]
+        played = rec["status"] in (STARTER, SUBBED_IN)
+        no = rec["no"]
+        rows.append({
+            # 背番号は試合ごとに変わりうるので、最新の関与試合の値を使う
+            "背番号": int(no) if str(no).isdigit() else (no or ""),
+            "ポジション": rec["pos"], "選手": rec["name"],
+            "クラブ": club["name"], "リーグ名": U21,
+            "最新試合関与試合": rec["date"], "経過": format_elapsed(rec["date"]),
+            "ステータス": rec["status"], "出場時間": rec["minutes_text"] or "",
+            "対戦相手": rec["opponent"], "試合結果": rec["result"],
+            "ゴール数": str(rec["goals"]) if played else "",
+            "警告/退場": f"{rec['yellow']}/{rec['red']}" if played else "",
+            "メンバー入り": acc["メンバー入り"], "先発": acc["先発"],
+            "途中出場": acc["途中出場"], "ベンチ入りのみ": acc["ベンチ入りのみ"],
+            "通算出場時間(分)": acc["通算出場時間(分)"],
+            "備考": f"Jリーグ公式({U21})", "URL": rec["url"],
+        })
+    rows.sort(key=lambda r: (U21_POS_ORDER.get(r["ポジション"], 9),
+                             r["背番号"] if isinstance(r["背番号"], int) else 999,
+                             r["選手"]))
+    return rows
+
+
+def u21_team_rows(club):
+    """指定したU-21クラブの台帳を最新にして、シート用の行を作る"""
+    season = CFG["year"]
+    games = jl_u21_games(club["id"])
+    con = u21_db_connect()
+    try:
+        if games:
+            u21_collect_games(con, season, club, games)
+        else:
+            log(f"{club['name']}: {season}シーズンの{U21}に消化済みの試合がありません",
+                "WARN")
+        rows = u21_ledger_rows(con, season, club)
+    finally:
+        con.close()
     if not rows:
-        raise ScrapeError(f"{U21}のメンバー表に {club['name']} の選手が1人もいない",
-                          f"チーム識別子 {team_key} の項目を確認", latest["url"])
-    debug(f"{club['name']}: メンバー{len(rows)}人を取得 (teamNameKey={team_key})")
+        debug(f"{club['name']}: 台帳に{season}シーズンの記録がありません")
+    else:
+        debug(f"{club['name']}: 台帳から{len(rows)}人ぶんの行を作成")
     return rows
 
 
 def u21_team_sheet_rows(clubs):
-    """対象クラブそれぞれの最新試合を集めて、U-21シート用の行にする
+    """対象クラブそれぞれの台帳を更新して、U-21シート用の行にする
 
     1クラブ失敗しても残りは出す。レンタル選手側の出力は止めない。
     """
@@ -2409,13 +2701,16 @@ def u21_team_sheet_rows(clubs):
 
 
 def minutes_to_entry(minutes):
-    """出場時間から出場時刻を逆算し、'後半15分' のような表記にする"""
-    if not minutes or minutes >= 90:
+    """出場時間から出場時刻を逆算し、"後半15分" のような表記にする
+
+    メンバー表を読めない大会(出場履歴しか無い場合)は分数しか分からないため、
+    そこから入った時刻を逆算する。メンバー表がある大会は jl_entry_label を
+    イベントの時刻に直接当てるので、こちらは使わない。
+    """
+    if not minutes or minutes >= FULL_MATCH_MINUTES:
         return None, None
-    entry = 90 - minutes
-    if entry >= 45:
-        return entry, f"後半{entry - 45}分"
-    return entry, f"前半{entry}分"
+    entry = FULL_MATCH_MINUTES - minutes
+    return entry, jl_entry_label(entry)
 
 
 def scrape_jleague(player, note_prefix=""):
@@ -3821,7 +4116,7 @@ def main():
     u21_df = pd.DataFrame(u21_rows, columns=U21_COLUMNS) if u21_rows else None
     if u21_df is not None:
         print("\n" + "=" * 78)
-        print(f" {U21} 最新試合のメンバー  (シート: {U21_SHEET})")
+        print(f" {U21} 出場台帳  (シート: {U21_SHEET})")
         print("=" * 78)
         print(u21_df.drop(columns=["URL", "備考"]).to_string(index=False))
 
