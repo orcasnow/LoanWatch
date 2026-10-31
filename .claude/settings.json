@@ -30,7 +30,14 @@
       "Bash(\".build-venv/Scripts/python.exe\" -c \"import tkinter; print\\('tkinter OK'\\); print\\(tkinter.TkVersion\\)\")",
       "Bash(cd \"C:/Users/lostm/Downloads/LoanWatch\")",
       "Bash(grep -c \"_tcl_data\\\\|_tk_data\" build/LoanWatch/warn-LoanWatch.txt)",
-      "Bash(.build-venv/Scripts/python.exe -c ' *)"
+      "Bash(.build-venv/Scripts/python.exe -c ' *)",
+      "PowerShell(Get-ChildItem \"$env:LOCALAPPDATA\\\\ms-playwright\" -Directory -ErrorAction SilentlyContinue | Select-Object Name; python -c \"import playwright, importlib.metadata as m; print\\(m.version\\('playwright'\\)\\)\")",
+      "PowerShell(python -m venv --clear .build-venv)",
+      "PowerShell(.build-venv\\\\Scripts\\\\python.exe -m pip install --upgrade pip --quiet)",
+      "PowerShell(.build-venv\\\\Scripts\\\\python.exe -m pip install --quiet -r requirements.txt)",
+      "PowerShell(.build-venv\\\\Scripts\\\\python.exe -m PyInstaller --version)",
+      "PowerShell($sp=\"C:\\\\Users\\\\lostm\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-lostm-Dropbox-LoanWatch\\\\5e40497b-7d76-48e3-ba29-dbe90be629ec\\\\scratchpad\"; python -m venv \"$sp\\\\venv\"; & \"$sp\\\\venv\\\\Scripts\\\\python.exe\" -m pip install --upgrade pip --quiet; & \"$sp\\\\venv\\\\Scripts\\\\python.exe\" -m pip install --quiet -r requirements.txt; & \"$sp\\\\venv\\\\Scripts\\\\python.exe\" -m PyInstaller --version)",
+      "PowerShell($sp=\"C:\\\\Users\\\\lostm\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-lostm-Dropbox-LoanWatch\\\\5e40497b-7d76-48e3-ba29-dbe90be629ec\\\\scratchpad\"; & \"$sp\\\\venv\\\\Scripts\\\\python.exe\" -m PyInstaller --noconfirm --clean --distpath \"$sp\\\\dist\" --workpath \"$sp\\\\build\" .\\\\LoanWatch.spec 2>&1 | Select-Object -Last 8; Get-Item \"$sp\\\\dist\\\\LoanWatch.exe\" | Select-Object Length, LastWriteTime)"
     ]
   }
 }

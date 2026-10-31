@@ -1,12 +1,25 @@
 # LoanWatch application and build dependencies
-# Tested with Python 3.13.14 on Windows.
+# Tested with Python 3.13.14 and 3.12.10 on Windows.
 #
 # Install:
 #   python -m pip install -r requirements.txt
 #   python -m playwright install chromium
 #
 # Build:
-#   python -m PyInstaller --noconfirm --clean .\LoanWatch.spec
+#   このフォルダは Dropbox 上にあるため、venv・作業フォルダ・出力先は
+#   Dropbox の外に置く(同期中のファイルがロックされ、venv の作成や
+#   ビルドが WinError 32 で失敗する)。PowerShell で:
+#
+#   $b = "$env:LOCALAPPDATA\LoanWatch-build"
+#   python -m venv "$b\venv"
+#   & "$b\venv\Scripts\python.exe" -m pip install -r requirements.txt
+#   & "$b\venv\Scripts\python.exe" -m PyInstaller --noconfirm --clean `
+#       --distpath "$b\dist" --workpath "$b\build" .\LoanWatch.spec
+#
+#   Chromium は %LOCALAPPDATA%\ms-playwright から同梱される(未導入なら先に
+#   python -m playwright install chromium)。差し替え前に動作確認する:
+#   & "$b\dist\LoanWatch.exe" --loanwatch-cli --playwright-smoke-test
+#   成功したら "$b\dist\LoanWatch.exe" をこのフォルダへコピーする。
 
 # Application runtime
 beautifulsoup4==4.13.4

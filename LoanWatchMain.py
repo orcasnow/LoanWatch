@@ -46,6 +46,9 @@ U-21 Ｊリーグ(チーム単位・台帳方式):
     所属リーグで代用し、備考に「リーグ名は所属リーグから推定」と入れる。
     対戦相手 は相手クラブ名のみ、試合結果 は対象クラブ視点の勝敗・スコア。
     警告/退場 は「警告数/退場数」で表示する。
+    通算出場〜通算警告/退場 は、リーグ名が J1〜J3 の行にだけ入る今季のリーグ戦の
+    通算(Jリーグ公式の出場履歴から集計)。出場履歴には出場した試合しか載らない
+    ため、ベンチ入りのみ・ベンチ外の試合数は数えない。
     --stale-days で指定した日数より古い試合しか取れなかった選手は末尾に列挙する。
 """
 
@@ -127,8 +130,12 @@ KW_SUBIN_COL = ["交代IN", "投入", "途中出場"]
 # 中止・延期を示す本文中の文言
 RE_CANCELLED = re.compile(r"(中止|延期|試合データがありません|データはありません)")
 
-COLUMNS = ["選手", "クラブ", "リーグ名", "日付", "経過", "チーム最新試合日付", "ステータス",
-           "出場時間", "対戦相手", "試合結果", "ゴール数", "警告/退場", "備考", "URL"]
+# J1〜J3 の行にだけ入る、今季のリーグ戦の通算成績
+TOTAL_COLUMNS = ["通算出場", "通算先発", "通算途中出場", "通算出場時間(分)",
+                 "通算ゴール", "通算警告/退場"]
+COLUMNS = (["選手", "クラブ", "リーグ名", "日付", "経過", "チーム最新試合日付", "ステータス",
+            "出場時間", "対戦相手", "試合結果", "ゴール数", "警告/退場"]
+           + TOTAL_COLUMNS + ["備考", "URL"])
 RE_GAME_URL = re.compile(r"/soccer/match/_/gameId/(\d+)")
 
 HEADERS = {
@@ -1287,7 +1294,34 @@ def with_other_competitions(rows, player, season_start):
         return rows
     rows = with_u21_row(rows, player, season_start)
     rows = with_levain_row(rows, player, season_start)
-    return with_emperor_row(rows, player, season_start)
+    rows = with_emperor_row(rows, player, season_start)
+    return with_league_totals(rows, player)
+
+
+def with_league_totals(rows, player):
+    """J1〜J3 の行に、今季のリーグ戦の通算成績を併記して返す
+
+    出場履歴は1回の実行中キャッシュされるので、選手ページへのアクセスは増えない。
+    """
+    targets = [(r, jl_division(r.get("リーグ名", ""))) for r in rows]
+    targets = [(r, division) for r, division in targets if division]
+    if not targets:
+        return rows
+    try:
+        df, _ = jl_history_df(player)
+    except ScrapeError as e:
+        log(f"リーグ通算の確認に失敗: {e.summary()}", "WARN")
+        return rows
+    for row, division in targets:
+        totals = jl_league_totals(df, division)
+        if totals is None:
+            debug(f"出場履歴に大会列が無いためJ{division}の通算をスキップ")
+            continue
+        row.update(totals)
+        log(f"J{division}の今季通算: {totals['通算出場']}試合"
+            f"(先発{totals['通算先発']}) {totals['通算出場時間(分)']}分 "
+            f"{totals['通算ゴール']}得点")
+    return rows
 
 
 def with_cup_row(rows, player, season_start, build_row, label, fallback=None):
@@ -1515,6 +1549,11 @@ RE_U21 = re.compile(r"U-?21", re.I)
 LEVAIN = "ルヴァンカップ"
 LEVAIN_KIND = "4"
 RE_LEVAIN = re.compile(r"ルヴァン|ナビスコ")
+# J1〜J3 リーグ戦の判定用(NFKC正規化してから照合する)。出場履歴の "明治安田Ｊ１" と
+# 所属リーグの "２０２６／２７明治安田Ｊ１リーグ" の両方を通し、別大会の
+# 百年構想リーグ("Ｊ１百年構想" / "Ｊ２・Ｊ３百年構想")は通さない。
+RE_JL_DIVISION = re.compile(r"明治安田J([123])(?:リーグ)?$")
+RE_JL_CARDS = re.compile(r"(\d+)\s*/\s*(\d+)")
 # 選手ページが持つ「現在の所属リーグ」。埋め込みJSONの入れ子の深さによって
 # 引用符のエスケープ(\")が付いたり付かなかったりするため \\* で吸収する。
 #   ..."gameKindName":"２０２６／２７明治安田Ｊ１リーグ","gameKindId":2...
@@ -1612,8 +1651,10 @@ def jl_records_to_frame(records):
             JL_COL_CARDS: rec.get("cards", ""),
             # 大会ID。所属リーグ(gameKindId)と突き合わせて大会名を引くのに使う
             "_kind": str(rec.get("gameKindId", "")),
+            # シーズン。2026/27 のように年をまたぐシーズンも開幕年で入っている
+            "_year": str(rec.get("year", "")),
         })
-    return pd.DataFrame(rows, columns=JL_HISTORY_COLUMNS + ["_kind"])
+    return pd.DataFrame(rows, columns=JL_HISTORY_COLUMNS + ["_kind", "_year"])
 
 
 def jl_history_table(html):
@@ -1816,6 +1857,45 @@ def jl_u21_row(player, df, season_start):
     return jl_latest_comp_row(player, df, season_start,
                               lambda comp, kind: RE_U21.search(comp),
                               "U-21 Ｊリーグ")
+
+
+def jl_division(league):
+    """大会名から J1〜J3 の区分('1'〜'3')を返す。リーグ戦でなければ None"""
+    m = RE_JL_DIVISION.search(norm(league))
+    return m.group(1) if m else None
+
+
+def jl_league_totals(df, division):
+    """出場履歴から、今季の J1〜J3 リーグ戦の通算成績を TOTAL_COLUMNS の形で返す
+
+    出場履歴には出場した試合しか載らない(2026年10月に全選手分で確認)ため、
+    ベンチ入りのみ・ベンチ外の試合数は数えられない。大会列が無ければ None。
+    """
+    comp_col = find_col(df.columns, [JL_COL_COMP])
+    if comp_col is None:
+        return None
+    target = df[[jl_division(comp) == division for comp in df[comp_col]]]
+    # 出場履歴は過去シーズン分も含む。シーズン(year)が読めればそれで絞り、
+    # HTMLの表から読んだ場合(year が無い)は対象年の1月1日以降に絞る。
+    if "_year" in target.columns and (target["_year"] != "").all():
+        target = target[target["_year"] == str(CFG["year"])]
+    else:
+        target = target[target["_date"] >= date(CFG["year"], 1, 1)]
+
+    starts = minutes = goals = yellow = red = 0
+    for _, rec in target.iterrows():
+        if "先発" in jl_value(rec, df.columns, JL_COL_APP):
+            starts += 1
+        minutes += _to_minutes(jl_value(rec, df.columns, JL_COL_MIN)) or 0
+        goals += _to_minutes(jl_value(rec, df.columns, JL_COL_GOALS)) or 0
+        m = RE_JL_CARDS.search(jl_value(rec, df.columns, JL_COL_CARDS))
+        if m:
+            yellow += int(m.group(1))
+            red += int(m.group(2))
+    return {"通算出場": len(target), "通算先発": starts,
+            "通算途中出場": len(target) - starts,
+            "通算出場時間(分)": minutes, "通算ゴール": goals,
+            "通算警告/退場": f"{yellow}/{red}"}
 
 
 def jl_levain_row(player, df, season_start):
