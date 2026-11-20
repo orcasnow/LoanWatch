@@ -1,5 +1,8 @@
 # LoanWatch application and build dependencies
-# Tested with Python 3.13.14 and 3.12.10 on Windows.
+# Tested with Python 3.15.2 on Windows.
+# Python 3.12/3.13 用の旧ピン留め(pandas 2.3 系)は requirements-313.txt。
+# pandas 3 は pyarrow が無ければ文字列列を Python 実装で持つ。spec で
+# pyarrow を除外しているので、開発環境にも入れない(挙動を exe と揃える)。
 #
 # Install:
 #   python -m pip install -r requirements.txt
@@ -11,7 +14,7 @@
 #   ビルドが WinError 32 で失敗する)。PowerShell で:
 #
 #   $b = "$env:LOCALAPPDATA\LoanWatch-build"
-#   python -m venv "$b\venv"
+#   py -3.15 -m venv "$b\venv"
 #   & "$b\venv\Scripts\python.exe" -m pip install -r requirements.txt
 #   & "$b\venv\Scripts\python.exe" -m PyInstaller --noconfirm --clean `
 #       --distpath "$b\dist" --workpath "$b\build" .\LoanWatch.spec
@@ -28,14 +31,13 @@ charset-normalizer==3.4.2
 greenlet==3.5.1
 html5lib==1.1
 idna==3.10
-lxml==6.0.0
-numpy==2.1.3
+lxml==6.1.3
+numpy==2.5.5
 openpyxl==3.1.5
-pandas==2.3.3
+pandas==3.1.1
 playwright==1.60.0
 pyee==13.0.1
 python-dateutil==2.9.0.post0
-pytz==2025.2
 requests==2.32.4
 six==1.17.0
 soupsieve==2.7
@@ -50,7 +52,7 @@ et_xmlfile==2.0.0
 altgraph==0.17.5
 packaging==25.0
 pefile==2024.8.26
-pyinstaller==6.17.0
-pyinstaller-hooks-contrib==2025.10
+pyinstaller==6.22.3
+pyinstaller-hooks-contrib==2026.10
 pywin32-ctypes==0.2.3
 setuptools==80.9.0
