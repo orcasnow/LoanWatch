@@ -3,6 +3,10 @@
 ここだけを書き換える。LoanWatchMain.py(CUI)・LoanWatchGui.py(GUI)・
 PlayersEditor.py(選手設定画面)が、この値を読んで表示する。
 
+  5.0    Python 3.15 ベースに移行。pandas 3.1・numpy 2.5・lxml 6.1・
+         PyInstaller 6.22 へ更新し、exe も Python 3.15 でビルドする
+         (GUI の Tcl/Tk は 9.0)。取得・判定・出力の内容は 4.2 と同じ。
+         Python 3.12/3.13 で動かす場合は requirements-313.txt を使う。
   4.2    J1〜J3 の行に、今季のリーグ戦の通算成績(通算出場/通算先発/通算途中出場/
          通算出場時間/通算ゴール/通算警告・退場)を併記する列を追加。Jリーグ公式の
          出場履歴から集計する。百年構想リーグは別大会として含めない。
@@ -36,4 +40,4 @@ PlayersEditor.py(選手設定画面)が、この値を読んで表示する。
   2.1    GUI版
 """
 
-APP_VERSION = "4.2"
+APP_VERSION = "5.0"
